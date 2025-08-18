@@ -1,0 +1,142 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Determining Platform Costs</title>
+  <link rel='stylesheet' type='text/css' href='../../main.css'>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script type="text/javascript" src="toc.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Determining Platform Costs</h1>
+    <a href="../../"><img class="logo" src="../../logo-car.png" /></a>
+    <nav>
+      <ul>
+        <li><a href="../../demo/">Try</a></li>
+        <li><a href="installing.html">Install</a></li>
+        <li><a href="tutorial.html">Learn</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <p>When defining a <a href="platforms.html">platform</a>,
+  every representation and operation must have an associated cost.
+  This cost helps <a href="../../">Herbie</a> decide between multiple
+  accurate programs, guiding it towards the one that will run the
+  fastest on the target platform.</p>
+
+  <h2>How to Calculate Costs</h2>
+
+  <p>The process involves benchmarking each operation within a hot loop,
+  measuring its execution time, and then normalizing these timings
+  against a baseline to determine relative costs. We need to determine
+  two kinds of costs:</p>
+
+  <ol>
+    <li><dfn>Representation Costs</dfn>: The cost of reading a value of
+    a particular representation from memory. We can measure this by
+    benchmarking the identity function (does nothing but return its
+    input) over each representation. This gives us a baseline move cost
+    for each representation like <code>&lt;binary64&gt;</code> or
+    <code>&lt;bool&gt;</code>.</li>
+
+    <li><dfn>Operation Cost</dfn>: The cost of executing a specific
+    floating-point operation, like <code>+</code> or <code>sin</code>.
+    We measure this by benchmarking the operation itself.</li>
+  </ol>
+
+  <p>Once these timings have been determined, the final step is to
+  normalize them. Usually, normalizing against the cheapest operation
+  (often the boolean move cost) by calling its cost <code>1</code> is a
+  practical approach. In general, as long as you have cost values that
+  more or less represent the relative difference in timing between
+  operations (e.g., the costs show that <code>+</code> is
+  significantly cheaper than <code>cos</code> and about the same as
+  <code>-</code>), you should be fine. Nevertheless, you must be
+  careful when profiling.</p>
+
+  <h2>Reliable Profiling</h2>
+
+  <p>Modern computers and runtimes have many complex systems that can
+  complicate getting accurate measurements. Here are a few key things
+  to watch out for.</p>
+
+  <h3>Compiler Optimizations</h3>
+
+  <p>Modern compilers attempt to optimize executables to be the fastest
+  they can possibly be without affecting the program's final result.
+  This section applies primarily to AOT and JIT compilers. Here are two
+  optimizations to look out for:</p>
+
+  <p><dfn>Dead code elimination</dfn> is an optimization where the
+  compiler can delete a function call entirely. This can happen when
+  you benchmark a function but never use its result. For example, if
+  you had a for loop that simply added two numbers without using the
+  result, the compiler might delete this block of code entirely as it
+  has no effect on the program's final behavior. To fix this, you must
+  ensure that the result of your benchmarked operation is always used
+  in a way that the compiler can't ignore it. One way to ensure that
+  the result of a benchmarked optimization is always used is by having
+  a "sink variable" to which you can add the result of each operation.
+  This ensures that each operation has a side-effect without
+  influencing the relative costs.</p>
+
+  <p><dfn>Constant folding</dfn> is an optimization where expressions
+  with constant inputs (e.g. <code>cos(0.0)</code>) is replaced with
+  the evaluated result at compile-time (<code>1.0</code>). To fix this,
+  always benchmark with inputs that are not known at compile time.</p>
+
+  <h3>Computer and Runtime</h3>
+
+  <p><dfn>Cache effects</dfn> can drastically affect a piece of code's
+  performance, especially when using JIT compilation. The first time a
+  piece of code is run may be slower because the compiler has to
+  translate to machine code. This is called a cold start. However,
+  subsequent runs may be much faster because the compiled code is
+  cached (and often optimized). The fix is to always include a warmup
+  phase in the benchmark where the hot loop is run a couple of times to
+  ensure the caches/optimizations are ready before actual benchmarking.
+  Discard the results from the warmup phase.</p>
+
+  <p><dfn>Background noise</dfn> from the computer and runtime,
+  including garbage collection, system updates, and other background
+  processes, can interrupt the benchmark and results. Try to ensure you
+  have a "quiet" machine and that the garbage collector runs
+  predictably and doesn't affect the final measurement.</p>
+
+  <p><dfn>Vectorized calculations</dfn> can be necessary for reliable
+  measurements. Consider a Python library such as Numpy. A naive
+  benchmark over scalar values will produce a misleading result where
+  every operation takes approximately the same time. This is because
+  the Python interpreter and the overhead of calling the C++ backend
+  will end up dominating the measurement. Therefore, to get meaningful
+  performance measurements, benchmarks for a library such as Numpy must
+  be performed over vectors rather than scalars. This allows the
+  thousands or millions of operations to dominate the fixed cost,
+  revealing the true performance of the operations.</p>
+
+  <h3>Being Scientific</h3>
+
+  <p>After warming up, benchmark each operation for many iterations,
+  and take the minimum timing of all the iterations (assuming all the
+  timings are just about the same).</p>
+
+  <h2>Final Notes</h2>
+
+  <ul>
+    <li>The relative costs don't have to be perfectly accurate to be
+    effective: as long as they capture the general trend, they can make
+    a significant difference in performance on the target platform</li>
+
+    <li>Sanity check costs along the way: make sure functions such as
+    <code>exp</code> cost much more than <code>+</code>, functions like
+    <code>pow</code> have very high costs, etc.</li>
+
+    <li>Greater cost granularity is good as it often implies greater
+    accuracy (e.g., costs as integers distributed over 1 to 30 vs 1 to
+    15)</li>
+  </ul>
+
+</body>
+</html>

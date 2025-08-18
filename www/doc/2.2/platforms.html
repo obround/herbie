@@ -101,16 +101,18 @@
   <h2>Defining Representations</h2>
 
   <p>The typical platform starts by defining the representations it
-  uses and their costs with <code>define-representation<code>:</p>
+  uses and their costs with <code>define-representation</code>:</p>
 
   <pre>(define-representation &lt;bool&gt; #:cost 1)
 (define-representation &lt;binary64&gt; #:cost 1.5)</pre>
 
   <p>This cost is the cost for reading a variable or literal of that
-  representation. Note that platforms must explicitly define a cost
-  for the <code>&lt;bool&gt;</code> representation if it uses
-  booleans. If the platform forgets to define a representation that it
-  uses, Herbie will produce an error when loading the platform.</p>
+  representation. You can find more information on determining costs
+  <a href="costs.html">here</a>. Note that platforms must explicitly
+  define a cost for the <code>&lt;bool&gt;</code> representation if
+  it uses booleans. If the platform forgets to define a
+  representation that it uses, Herbie will produce an error when
+  loading the platform.</p>
 
   <p>If the same cost is used repeatedly, it can be convenient to
   define a variable:</p>
@@ -177,7 +179,9 @@
   input, one could use <code>(flsingle (/ 1.0 x))</code> for the body
   of the <code>lambda</code>.</p>
 
-  <p>The <code>#:cost</code> field gives this operation's cost, 3.</p>
+  <p>The <code>#:cost</code> field gives this operation's cost, 3.
+  You can find more information on accurately determining an
+  operation's cost <a href="costs.html">here</a>.</p>
 
   <h2>Defining Multiple Operations</h2>
   

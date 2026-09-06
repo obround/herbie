@@ -68,10 +68,11 @@
     (apply mk-pcontext sample)))
 
 ;; The main Herbie function
-(define (get-alternatives test train-pcontext test-pcontext #:sampler [sampler #f])
-  (unless train-pcontext
+(define (get-alternatives test joint-pcontext #:sampler [sampler #f])
+  (unless joint-pcontext
     (error 'get-alternatives "cannnot run without a pcontext"))
 
+  (define-values (train-pcontext test-pcontext) (partition-pcontext joint-pcontext))
   (define initial-expr
     (if (equal? (prog->spec (test-input test)) (test-spec test))
         (test-input test)
@@ -157,8 +158,7 @@
 (define (get-improve test)
   (random) ;; Tick the random number generator, for backwards compatibility
   (define sample (make-sampler test))
-  (define-values (train-pcontext test-pcontext) (partition-pcontext (sample)))
-  (get-alternatives test train-pcontext test-pcontext #:sampler (make-search-sampler test sample)))
+  (get-alternatives test (sample) #:sampler (make-search-sampler test sample)))
 
 ;;
 ;;  Public interface
@@ -203,9 +203,7 @@
         (timeline-event! 'start) ; Prevents the timeline from being empty.
         (define result
           (match command
-            ['alternatives
-             (define-values (train-pcontext test-pcontext) (partition-pcontext pcontext))
-             (get-alternatives test train-pcontext test-pcontext)]
+            ['alternatives (get-alternatives test pcontext)]
             ['cost (get-cost test)]
             ['errors (get-errors test pcontext)]
             ['explanations (get-explanations test pcontext)]

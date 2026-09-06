@@ -104,6 +104,8 @@
   (define covers (filter taylor-cover? preprocessing))
   ;; No sampler is provided when the pcontext is given by the user.
   (define sample (and sampler (pair? covers) (sampler (covers-constraint covers))))
+  ;; Return train and validation sample. The validation sample only applies
+  ;; to Taylor covers, and ensures that it was effective.
   (if sample
       (values sample (pcontext-append pcontext sample))
       (values pcontext pcontext)))

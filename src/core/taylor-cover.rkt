@@ -52,25 +52,23 @@
 
 (define (build-covers block spec-v var ctx)
   (define out-repr (context-repr ctx))
-  (define taylor-block (block-empty ctx))
-  (define v ((block-copy-only! taylor-block block) spec-v))
   (reap [sow]
-        (parameterize ([reduce (block-reduce taylor-block)]
-                       [add (lambda (x) (block-add! taylor-block x))])
-          (define block->expr (block-exprs taylor-block))
+        (parameterize ([reduce (block-reduce block)]
+                       [add (lambda (x) (block-add! block x))])
+          (define block->expr (block-exprs block))
           (define all-series
-            (map first (taylor-coefficients taylor-block (list v) (list var) taylor-transforms)))
+            (map first (taylor-coefficients block (list spec-v) (list var) taylor-transforms)))
           (for ([series (in-list all-series)]
                 [transform (in-list taylor-transforms)]
                 #:when (cover-lowerable? (first transform) out-repr))
             (match-define (list name forward inverse) transform)
             (define tform (cons forward inverse))
-            (define next-term (taylor-terms series taylor-block var #:transform tform))
+            (define next-term (taylor-terms series block var #:transform tform))
             (define kept (next-term))
             (define dropped (next-term))
             (when (and kept dropped)
-              (define kept-term (evaluate-term taylor-block kept out-repr))
-              (define dropped-term (evaluate-term taylor-block dropped out-repr))
+              (define kept-term (evaluate-term block kept out-repr))
+              (define dropped-term (evaluate-term block dropped out-repr))
               (when (and kept-term dropped-term)
                 (define radius (cover-radius kept-term dropped-term out-repr))
                 (define bound
@@ -96,10 +94,12 @@
     ['-inf `(<= ,var ,(- bound))]))
 
 (define (covers-constraint covers)
-  (match (for/list ([cover (in-list covers)])
-           `(not ,(cover-condition cover)))
-    [(list outside) outside]
-    [outsides `(and ,@outsides)]))
+  (define outsides
+    (for/list ([cover (in-list covers)])
+      `(not ,(cover-condition cover))))
+  ;; Rival 2 only supports binary `and`
+  (for/fold ([constraint (first outsides)]) ([outside (in-list (rest outsides))])
+    `(and ,constraint ,outside)))
 
 (define (cover-wrap cover expression ctx)
   (match-define (taylor-cover _ _ _ arm) cover)

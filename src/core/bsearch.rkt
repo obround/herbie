@@ -3,56 +3,57 @@
 (require math/bigfloat
          racket/random)
 (require "../config.rkt"
-         "../utils/alternative.rkt"
+         "../core/alternative.rkt"
          "../utils/common.rkt"
          "../utils/timeline.rkt"
          "../utils/errors.rkt"
-         "../utils/float.rkt"
+         "../syntax/float.rkt"
          "../utils/pretty-print.rkt"
          "../syntax/types.rkt"
          "../syntax/syntax.rkt"
          "../syntax/platform.rkt"
+         "../syntax/block.rkt"
          "compiler.rkt"
          "regimes.rkt"
-         "rival.rkt"
+         "../syntax/rival.rkt"
          "sampling.rkt"
          "points.rkt"
          "programs.rkt")
 
 (provide combine-alts
-         (struct-out sp)
+         combine-alts/binary
          regimes-pcontext-masks)
 
 (module+ test
   (require rackunit))
 
-;; A splitpoint (sp a b pt) means we should use alt a if b < pt
-;; The last splitpoint uses +nan.0 for pt and represents the "else"
-(struct sp (cidx bexpr point) #:prefab)
+(define (finish-combine-alts block alts v splitindices splitpoints)
+  (define splitpoints* (append splitpoints (list (sp (si-cidx (last splitindices)) v +nan.0))))
+  (define v*
+    (for/fold ([v (alt-expr (list-ref alts (sp-cidx (last splitpoints*))))])
+              ([splitpoint (cdr (reverse splitpoints*))])
+      (define repr (block-repr-of (sp-bexpr splitpoint)))
+      (define if-impl (get-fpcore-impl 'if '() (list (get-representation 'bool) repr repr)))
+      (define <=-impl (get-fpcore-impl '<= '() (list repr repr)))
+      (define lit-v
+        (block-add! block
+                    (literal (repr->real (sp-point splitpoint) repr) (representation-name repr))))
+      (define cmp-v (block-add! block (list <=-impl (sp-bexpr splitpoint) lit-v)))
+      (block-add! block (list if-impl cmp-v (alt-expr (list-ref alts (sp-cidx splitpoint))) v))))
 
-(define (combine-alts best-option start-prog ctx pcontext)
-  (match-define (option splitindices alts pts expr _) best-option)
-  (match splitindices
-    [(list (si cidx _)) (list-ref alts cidx)]
-    [_
-     (timeline-event! 'bsearch)
-     (define splitpoints (sindices->spoints pts expr alts splitindices start-prog ctx pcontext))
+  ;; We don't want unused alts in our history!
+  (define-values (alts* splitpoints**) (remove-unused-alts alts splitpoints*))
+  (alt v* (list 'regimes splitpoints**) alts*))
 
-     (define expr*
-       (for/fold ([expr (alt-expr (list-ref alts (sp-cidx (last splitpoints))))])
-                 ([splitpoint (cdr (reverse splitpoints))])
-         (define repr (repr-of (sp-bexpr splitpoint) ctx))
-         (define if-impl (get-fpcore-impl 'if '() (list (get-representation 'bool) repr repr)))
-         (define <=-impl (get-fpcore-impl '<= '() (list repr repr)))
-         `(,if-impl (,<=-impl ,(sp-bexpr splitpoint)
-                              ,(literal (repr->real (sp-point splitpoint) repr)
-                                        (representation-name repr)))
-                    ,(alt-expr (list-ref alts (sp-cidx splitpoint)))
-                    ,expr)))
+(define (combine-alts block best-option)
+  (match-define (option splitindices alts pts v) best-option)
+  (define splitpoints (sindices->spoints/left block pts v splitindices))
+  (finish-combine-alts block alts v splitindices splitpoints))
 
-     ;; We don't want unused alts in our history!
-     (define-values (alts* splitpoints*) (remove-unused-alts alts splitpoints))
-     (alt expr* (list 'regimes splitpoints*) alts*)]))
+(define (combine-alts/binary block best-option start-prog pcontext)
+  (match-define (option splitindices alts pts v) best-option)
+  (define splitpoints (sindices->spoints/binary block pts v alts splitindices start-prog pcontext))
+  (finish-combine-alts block alts v splitindices splitpoints))
 
 (define (remove-unused-alts alts splitpoints)
   (for/fold ([alts* '()]
@@ -66,9 +67,9 @@
     (values alts** splitpoints**)))
 
 ;; Invariant: (pred p1) and (not (pred p2))
-(define (binary-search-floats pred p1 p2 repr)
+(define (binary-search-floats pred p1 p2 repr ulps)
   (cond
-    [(<= (ulps->bits (ulp-difference p1 p2 repr)) (*binary-search-accuracy*))
+    [(<= (ulps->bits (ulps p1 p2)) (*binary-search-accuracy*))
      (timeline-push! 'stop "narrow-enough" 1)
      (values p1 p2)]
     [else
@@ -82,17 +83,36 @@
        [(eq? cmp 'fail)
         (timeline-push! 'stop "predicate-failed" 1)
         (values p1 p2)]
-       [(negative? cmp) (binary-search-floats pred p3 p2 repr)]
-       [(positive? cmp) (binary-search-floats pred p1 p3 repr)]
+       [(negative? cmp) (binary-search-floats pred p3 p2 repr ulps)]
+       [(positive? cmp) (binary-search-floats pred p1 p3 repr ulps)]
        ;; cmp = 0 usually means sampling failed, so we give up
        [else
         (timeline-push! 'stop "predicate-same" 1)
         (values p1 p2)])]))
 
-(define (extract-subexpression expr var pattern ctx)
-  (define body* (replace-expression expr pattern var))
-  (define vars* (set-subtract (context-vars ctx) (free-variables pattern)))
-  (and (subset? (free-variables body*) (cons var vars*)) body*))
+(define (extract-subexpression block v pattern-v block* var-v)
+  (define pattern-idx (val-idx pattern-v))
+  (define var (val-def var-v))
+  (define free-vars (block-free-vars block))
+  (define vars* (set-subtract (list->set (block-vars block)) (free-vars pattern-v)))
+  (define copy
+    (block-recurse
+     block
+     (λ (v recurse)
+       (cond
+         [(= (val-idx v) pattern-idx) var-v]
+         [else (block-push! block* (expr-recurse (val-def v) (compose val-idx recurse)))]))))
+  (define body-v (copy v))
+  (define free-vars* (block-free-vars block*))
+  (and (subset? (free-vars* body-v) (set-add vars* var)) body-v))
+
+(define (deterministic-branch-var block)
+  (define used-vars (list->set (block-vars block)))
+  (let loop ([n 0])
+    (define var (string->symbol (format "branch-~a" n)))
+    (if (set-member? used-vars var)
+        (loop (add1 n))
+        var)))
 
 (define (prepend-argument evaluator val pcontext)
   (define pts
@@ -102,50 +122,23 @@
   ; Since the sampler does not call rival-analyze, the hint is set to #f
   (define (new-sampler)
     (values (vector-append (vector val) (random-ref pts)) #f))
-  (define-values (results _) (batch-prepare-points evaluator new-sampler))
+  (define-values (results _) (block-prepare-points evaluator new-sampler))
   (apply mk-pcontext results))
 
 (define/reset *prepend-arguement-cache* (make-hash))
-(define (cache-get-prepend v expr macro)
-  (define key (cons expr v))
+(define (cache-get-prepend v key-v macro)
+  (define key (cons key-v v))
   (hash-ref! (*prepend-arguement-cache*) key (lambda () (macro v))))
 
-(define (valid-splitpoints? splitpoints)
-  (and (= (set-count (list->set (map sp-bexpr splitpoints))) 1) (nan? (sp-point (last splitpoints)))))
-
 ;; Accepts a list of sindices in one indexed form and returns the
-;; proper splitpoints in float form. A crucial constraint is that the
+;; proper interior splitpoints in float form. A crucial constraint is that the
 ;; float form always come from the range [f(idx1), f(idx2)). If the
 ;; float form of a split is f(idx2), or entirely outside that range,
 ;; problems may arise.
-(define/contract (sindices->spoints points expr alts sindices start-prog ctx pcontext)
-  (-> (listof vector?) any/c (listof alt?) (listof si?) any/c context? pcontext? valid-splitpoints?)
-  (define repr (repr-of expr ctx))
-
-  (define eval-expr (compile-prog expr ctx))
-
-  (define var (gensym 'branch))
-  (define ctx* (context-extend ctx var repr))
-  (define progs (map (compose (curryr extract-subexpression var expr ctx) alt-expr) alts))
-  (define start-prog-sub (extract-subexpression start-prog var expr ctx))
-
-  ; Not totally clear if this should actually use the precondition
-  (define start-real-compiler
-    (and start-prog (make-real-compiler (list (prog->spec start-prog)) (list ctx*))))
-
-  (define (prepend-macro v)
-    (prepend-argument start-real-compiler v pcontext))
-
-  (define (find-split expr1 expr2 v1 v2)
-    (define (pred v)
-      (define pctx
-        (parameterize ([*num-points* (*binary-search-test-points*)])
-          (cache-get-prepend v expr prepend-macro)))
-      (define acc1 (errors-score (errors expr1 pctx ctx*)))
-      (define acc2 (errors-score (errors expr2 pctx ctx*)))
-      (- acc1 acc2))
-    (define-values (p1 p2) (binary-search-floats pred v1 v2 repr))
-    (left-point p1 p2))
+(define/contract (sindices->spoints/left block points v sindices)
+  (-> block? (listof vector?) val? (listof si?) (listof sp?))
+  (define repr (block-repr-of v))
+  (define eval-expr (compose (curryr vector-ref 0) (compile-block block (list v))))
 
   (define (left-point p1 p2)
     (define left ((representation-repr->bf repr) p1))
@@ -159,42 +152,83 @@
         p1
         ((representation-bf->repr repr) out)))
 
-  (define use-binary
-    (and (flag-set? 'reduce 'binary-search)
-         ;; Binary search is only valid if we correctly extracted the branch expression
-         (andmap identity (cons start-prog-sub progs))))
+  (for/list ([si1 sindices]
+             [si2 (cdr sindices)])
+    (define p1 (eval-expr (list-ref points (sub1 (si-pidx si1)))))
+    (define p2 (eval-expr (list-ref points (si-pidx si1))))
 
-  (append (for/list ([si1 sindices]
-                     [si2 (cdr sindices)])
-            (define prog1 (list-ref progs (si-cidx si1)))
-            (define prog2 (list-ref progs (si-cidx si2)))
+    (define timeline-stop! (timeline-start! 'bstep (value->json p1 repr) (value->json p2 repr)))
+    (define split-at (left-point p1 p2))
+    (timeline-stop!)
 
-            (define p1 (eval-expr (list-ref points (sub1 (si-pidx si1)))))
-            (define p2 (eval-expr (list-ref points (si-pidx si1))))
+    (timeline-push! 'method "left-value")
+    (sp (si-cidx si1) v split-at)))
 
-            (define timeline-stop!
-              (timeline-start! 'bstep (value->json p1 repr) (value->json p2 repr)))
-            (define split-at
-              (if use-binary
-                  (find-split prog1 prog2 p1 p2)
-                  (left-point p1 p2)))
-            (timeline-stop!)
+(define/contract (sindices->spoints/binary block points target-v alts sindices start-prog pcontext)
+  (-> block? (listof vector?) val? (listof alt?) (listof si?) any/c pcontext? (listof sp?))
+  (define repr (block-repr-of target-v))
+  (define ulps (repr-ulps repr))
+  (define eval-expr (compose (curryr vector-ref 0) (compile-block block (list target-v))))
+  (define v-node (val-def target-v))
+  (define var
+    (if (symbol? v-node)
+        v-node
+        (deterministic-branch-var block)))
+  (define-values (block* var-v) (block-empty-extend block var repr))
+  (define progs
+    (for/list ([alt (in-list alts)])
+      (extract-subexpression block (alt-expr alt) target-v block* var-v)))
+  (define start-prog-sub (extract-subexpression block start-prog target-v block* var-v))
+  (unless (and start-prog-sub (andmap identity progs))
+    (raise-user-error
+     'sindices->spoints/binary
+     "mainloop called binary splitpoint search without extractable critical subexpressions"))
+  (define spec-block (block-empty (context (block-vars block*) #f (block-var-reprs block*))))
+  (define spec-vs (block-to-spec! block* spec-block (list start-prog-sub)))
+  (define start-real-compiler (make-real-compiler spec-block spec-vs (list repr)))
 
-            (timeline-push! 'method (if use-binary "binary-search" "left-value"))
-            (sp (si-cidx si1) expr split-at))
-          (list (sp (si-cidx (last sindices)) expr +nan.0))))
+  (define (prepend-macro v)
+    (prepend-argument start-real-compiler v pcontext))
+
+  (define (find-split si1 si2 p1 p2)
+    (define v1 (list-ref progs (si-cidx si1)))
+    (define v2 (list-ref progs (si-cidx si2)))
+    (define eval-errors (compile-block block* (list v1 v2)))
+    (define score-ulps (repr-ulps (block-repr-of v1)))
+    (define (pred v)
+      (define pctx
+        (parameterize ([*num-points* (*binary-search-test-points*)])
+          (cache-get-prepend v target-v prepend-macro)))
+      (for/sum ([(pt ex) (in-pcontext pctx)])
+               (match-define (vector out1 out2) (eval-errors pt))
+               (- (ulps->bits (score-ulps out1 ex)) (ulps->bits (score-ulps out2 ex)))))
+    (define-values (bp1 _) (binary-search-floats pred p1 p2 repr ulps))
+    bp1)
+
+  (for/list ([si1 sindices]
+             [si2 (cdr sindices)])
+    (define p1 (eval-expr (list-ref points (sub1 (si-pidx si1)))))
+    (define p2 (eval-expr (list-ref points (si-pidx si1))))
+
+    (define timeline-stop! (timeline-start! 'bstep (value->json p1 repr) (value->json p2 repr)))
+    (define split-at (find-split si1 si2 p1 p2))
+    (timeline-stop!)
+
+    (timeline-push! 'method "binary-search")
+    (sp (si-cidx si1) target-v split-at)))
 
 (define (regimes-pcontext-masks pcontext splitpoints alts ctx)
   (define num-alts (length alts))
+  (define num-points (pcontext-length pcontext))
   (define bexpr (sp-bexpr (car splitpoints)))
-  (define ctx* (struct-copy context ctx [repr (repr-of bexpr ctx)]))
+  (define repr (repr-of bexpr ctx))
+  (define ctx* (struct-copy context ctx [repr repr]))
   (define prog (compile-prog bexpr ctx*))
-
-  (flip-lists (for/list ([(pt ex) (in-pcontext pcontext)])
-                (define val (prog pt))
-                (define alt-id
-                  (for/first ([right (in-list splitpoints)]
-                              #:when (or (equal? (sp-point right) +nan.0)
-                                         (<=/total val (sp-point right) (context-repr ctx*))))
-                    (sp-cidx right)))
-                (build-list num-alts (curry = alt-id)))))
+  (define masks (build-vector num-alts (λ (_) (make-vector num-points #f))))
+  (for ([(pt _) (in-pcontext pcontext)]
+        [idx (in-naturals)])
+    (define val (prog pt))
+    (for/first ([right (in-list splitpoints)]
+                #:when (or (equal? (sp-point right) +nan.0) (<=/total val (sp-point right) repr)))
+      (vector-set! (vector-ref masks (sp-cidx right)) idx #t)))
+  masks)

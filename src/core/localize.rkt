@@ -1,18 +1,19 @@
 #lang racket
 
 (require math/bigfloat
+         math/flonum
          racket/hash)
 (require "../utils/common.rkt"
-         "../utils/float.rkt"
+         "../syntax/float.rkt"
          "../syntax/sugar.rkt"
          "../syntax/syntax.rkt"
          "../syntax/types.rkt"
          "../syntax/platform.rkt"
-         "batch.rkt"
+         "../syntax/block.rkt"
          "compiler.rkt"
          "points.rkt"
          "programs.rkt"
-         "rival.rkt")
+         "../syntax/rival.rkt")
 
 (module+ test
   (require rackunit
@@ -23,11 +24,11 @@
          eval-progs-real
          local-error-as-tree)
 
-(define (eval-progs-real specs ctxs)
-  (define compiler (make-real-compiler specs ctxs))
+(define (eval-progs-real block vs reprs)
+  (define compiler (make-real-compiler block vs reprs))
   (define bad-pt
-    (for/list ([ctx* (in-list ctxs)])
-      ((representation-bf->repr (context-repr ctx*)) +nan.bf)))
+    (for/list ([repr (in-list reprs)])
+      ((representation-bf->repr repr) +nan.bf)))
   (define (<eval-prog-real> pt)
     (define-values (_ exs) (real-apply compiler pt))
     (or exs bad-pt))
@@ -43,16 +44,16 @@
 ;; Local error is high when `f` is highly sensitive to rounding error
 ;; in its inputs `x` and `y`.
 
-(define (local-error exact node repr get-exact)
+(define (local-error exact node ulps get-exact)
   (match node
     [(? literal?) 1]
     [(? symbol?) 1]
-    [(approx _ impl) (ulp-difference exact (get-exact impl) repr)]
+    [(approx _ impl) (ulps exact (get-exact impl))]
     [`(if ,c ,ift ,iff) 1]
     [(list f args ...)
      (define argapprox (map get-exact args))
      (define approx (apply (impl-info f 'fl) argapprox))
-     (ulp-difference exact approx repr)]))
+     (ulps exact approx)]))
 
 (define (make-matrix roots pcontext)
   (for/vector #:length (vector-length roots)
@@ -63,29 +64,26 @@
 (define (compute-local-errors subexprss ctx pcontext)
   (define exprs-list (append* subexprss)) ; unroll subexprss
   (define reprs-list (map (curryr repr-of ctx) exprs-list))
-  (define ctx-list
-    (for/list ([subexpr (in-list exprs-list)]
-               [repr (in-list reprs-list)])
-      (struct-copy context ctx [repr repr])))
+  (define ulps-list (map repr-ulps reprs-list))
+  (define-values (expr-block vs) (progs->block exprs-list #:ctx ctx))
+  (define roots (list->vector (map val-idx vs)))
 
-  (define expr-batch (progs->batch exprs-list))
-  (define roots (batch-roots expr-batch))
-
-  (define subexprs-fn (eval-progs-real (map prog->spec exprs-list) ctx-list))
+  (define-values (spec-block spec-vs) (progs->block (map prog->spec exprs-list) #:ctx ctx))
+  (define subexprs-fn (eval-progs-real spec-block spec-vs reprs-list))
 
   (define errs (make-matrix roots pcontext))
 
   (for ([(pt ex) (in-pcontext pcontext)]
         [pt-idx (in-naturals)])
     (define exacts (list->vector (subexprs-fn pt)))
-    (define (get-exact idx)
-      (vector-ref exacts (vector-member idx roots)))
+    (define (get-exact v)
+      (vector-ref exacts (vector-member (val-idx v) roots)))
     (for ([expr (in-list exprs-list)]
-          [root (in-vector roots)]
-          [repr (in-list reprs-list)]
+          [v vs]
+          [ulps (in-list ulps-list)]
           [exact (in-vector exacts)]
           [expr-idx (in-naturals)])
-      (define err (local-error exact (batch-ref expr-batch root) repr get-exact))
+      (define err (local-error exact (val-def v) ulps get-exact))
       (vector-set! (vector-ref errs expr-idx) pt-idx err)))
 
   (define n 0)
@@ -116,11 +114,9 @@
   ;; And the real result
   (define spec-list (map prog->spec exprs-list))
   (define reprs-list (map (curryr repr-of ctx) exprs-list))
-  (define ctx-list
-    (for/list ([subexpr (in-list exprs-list)]
-               [repr (in-list reprs-list)])
-      (struct-copy context ctx [repr repr])))
-  (define subexprs-fn (eval-progs-real spec-list ctx-list))
+  (define ulps-list (map repr-ulps reprs-list))
+  (define-values (spec-block spec-vs) (progs->block spec-list #:ctx ctx))
+  (define subexprs-fn (eval-progs-real spec-block spec-vs reprs-list))
 
   ;; And the absolute difference between the two
   (define exact-var-names
@@ -128,7 +124,7 @@
       (gensym 'exact)))
   (define delta-ctx
     (context (append (context-vars ctx) exact-var-names)
-             (get-representation 'binary64)
+             <binary64>
              (append (context-var-reprs ctx) reprs-list)))
   (define compare-specs
     (for/list ([spec (in-list spec-list)]
@@ -137,37 +133,37 @@
                [var (in-list exact-var-names)])
       (match (representation-type repr)
         ['bool 0] ; We can't subtract booleans so ignore them
-        ['real `(fabs (- ,spec ,var))])))
-  (define delta-fn (eval-progs-real compare-specs (map (const delta-ctx) compare-specs)))
+        ['real `(fabs (- ,spec ,var))]
+        [_ 0])))
+  (define-values (compare-block compare-vs) (progs->block compare-specs #:ctx delta-ctx))
+  (define delta-fn (eval-progs-real compare-block compare-vs (map (const <binary64>) compare-specs)))
 
-  (define expr-batch (progs->batch exprs-list))
-  (define roots (batch-roots expr-batch))
+  (define-values (expr-block vs) (progs->block exprs-list #:ctx ctx))
+  (define roots (list->vector (map val-idx vs)))
 
   (define ulp-errs (make-matrix roots pcontext))
   (define exacts-out (make-matrix roots pcontext))
   (define approx-out (make-matrix roots pcontext))
   (define true-error-out (make-matrix roots pcontext))
 
-  (define spec-vec (list->vector spec-list))
-  (define ctx-vec (list->vector ctx-list))
   (for ([(pt ex) (in-pcontext pcontext)]
         [pt-idx (in-naturals)])
 
     (define exacts (list->vector (subexprs-fn pt)))
-    (define (get-exact idx)
-      (vector-ref exacts (vector-member idx roots)))
+    (define (get-exact v)
+      (vector-ref exacts (vector-member (val-idx v) roots)))
 
     (define actuals (actual-value-fn pt))
     (define pt* (vector-append pt (remove-infinities actuals reprs-list)))
     (define deltas (list->vector (delta-fn pt*)))
 
-    (for ([repr (in-list reprs-list)]
-          [root (in-vector roots)]
+    (for ([ulps (in-list ulps-list)]
+          [v vs]
           [exact (in-vector exacts)]
           [actual (in-vector actuals)]
           [delta (in-vector deltas)]
           [expr-idx (in-naturals)])
-      (define ulp-err (local-error exact (batch-ref expr-batch root) repr get-exact))
+      (define ulp-err (local-error exact (val-def v) ulps get-exact))
       (vector-set! (vector-ref exacts-out expr-idx) pt-idx exact)
       (vector-set! (vector-ref approx-out expr-idx) pt-idx actual)
       (vector-set! (vector-ref ulp-errs expr-idx) pt-idx ulp-err)
@@ -221,7 +217,11 @@
     (define data (hash-ref data-hash expr))
     (define abs-error (~s (first (hash-ref data 'absolute-error))))
     (define ulp-error (~s (ulps->bits (first (hash-ref data 'ulp-errs))))) ; unused by Odyssey
-    (define avg-error (format-bits (errors-score (hash-ref data 'ulp-errs))))
+    (define ulp-errs (hash-ref data 'ulp-errs))
+    (define avg-error
+      (format-bits (errors-score (for/flvector #:length (length ulp-errs)
+                                               ([err (in-list ulp-errs)])
+                                               (ulps->bits err)))))
     (define exact-error (~s (translate-booleans (first (hash-ref data 'exact-values)))))
     (define actual-error (~s (translate-booleans (first (hash-ref data 'approx-values)))))
     (define percent-accurate

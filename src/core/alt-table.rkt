@@ -1,56 +1,89 @@
 #lang racket
 
-(require racket/hash)
-(require "../utils/alternative.rkt"
+(require math/flonum
+         "../config.rkt"
+         "../core/alternative.rkt"
          "../utils/common.rkt"
          "../utils/pareto.rkt"
          "../syntax/types.rkt"
          "../syntax/syntax.rkt"
          "../syntax/platform.rkt"
-         "batch.rkt"
+         "../syntax/block.rkt"
          "points.rkt"
          "programs.rkt")
 
-(provide (contract-out
-          (make-alt-table (pcontext? alt? any/c . -> . alt-table?))
-          (atab-active-alts (alt-table? . -> . (listof alt?)))
-          (atab-all-alts (alt-table? . -> . (listof alt?)))
-          (atab-not-done-alts (alt-table? . -> . (listof alt?)))
-          (atab-eval-altns (alt-table? (listof alt?) context? . -> . (values any/c any/c)))
-          (atab-add-altns (alt-table? (listof alt?) any/c any/c context? . -> . alt-table?))
-          (atab-set-picked (alt-table? (listof alt?) . -> . alt-table?))
-          (atab-completed? (alt-table? . -> . boolean?))
-          (atab-min-errors (alt-table? . -> . (listof real?)))))
+(provide (contract-out (make-alt-table (block? pcontext? alt? . -> . alt-table?))
+                       (atab-active-alts (alt-table? . -> . (listof alt?)))
+                       (atab-all-alts (alt-table? . -> . (listof alt?)))
+                       (atab-not-done-alts (alt-table? . -> . (listof alt?)))
+                       (atab-eval-altns (alt-table? block? (listof alt?) . -> . (values any/c any/c)))
+                       (atab-add-altns (alt-table? (listof alt?) any/c any/c . -> . alt-table?))
+                       (atab-set-picked (alt-table? (listof alt?) . -> . alt-table?))
+                       (atab-completed? (alt-table? . -> . boolean?))
+                       (atab-min-errors (alt-table? . -> . flvector?))
+                       (alt-block-costs (block? . -> . (val? . -> . real?)))))
 
 ;; Public API
 
 (struct alt-table (point-idx->alts alt->point-idxs alt->done? alt->cost pcontext all) #:prefab)
 
-(define (alt-batch-cost batch repr)
-  (define node-cost-proc (platform-node-cost-proc (*active-platform*)))
-  (define costs (make-vector (batch-length batch) 0))
-  (for ([node (in-batch batch)]
-        [i (in-naturals)])
-    (define cost
-      (match node
-        [(? literal?) ((node-cost-proc node repr))]
-        [(? symbol?) ((node-cost-proc node repr))]
-        [(? number?) 0] ; specs
-        [(approx _ impl) (vector-ref costs impl)]
-        [(list (? (negate impl-exists?) impl) args ...) 0] ; specs
-        [(list impl args ...)
-         (define cost-proc (node-cost-proc node repr))
-         (define itypes (impl-info impl 'itype))
-         (apply cost-proc (map (curry vector-ref costs) args))]))
-    (vector-set! costs i cost))
-  (for/list ([root (in-vector (batch-roots batch))])
-    (vector-ref costs root)))
+(define (sorted-index-union xs ys)
+  (match* (xs ys)
+    [('() _) ys]
+    [(_ '()) xs]
+    [((cons x xs*) (cons y ys*))
+     (cond
+       [(> x y) (cons x (sorted-index-union xs* ys))]
+       [(< x y) (cons y (sorted-index-union xs ys*))]
+       [else (cons x (sorted-index-union xs* ys*))])]))
 
-(define (make-alt-table pcontext initial-alt ctx)
-  (define cost (alt-cost initial-alt (context-repr ctx)))
-  (define errs (errors (alt-expr initial-alt) pcontext ctx))
+(define (alt-block-costs block)
+  (define active-platform (*active-platform*))
+  (define (node-cost v)
+    (match (val-def v)
+      [(? literal?) (platform-repr-cost active-platform (block-repr-of v))]
+      [(? symbol?) 0]
+      [(? number?) 0] ; specs
+      [(approx _ _) 0]
+      [(list (? (negate impl-exists?) _) args ...) 0] ; specs
+      [(list impl args ...) (impl-info impl 'cost)]))
+  (define (sum-set nodes)
+    (for/sum ([idx (in-list nodes)]) (node-cost (val block idx))))
+  (define (node-reachable-mask v recurse)
+    (define node (val-def v))
+    (define idx (val-idx v))
+    (define self-set (list idx))
+    (match node
+      [(? number?) '()] ; specs
+      [(approx _ impl) (recurse impl)]
+      [(list (? (negate impl-exists?) _) args ...) '()] ; specs
+      [(list impl args ...)
+       (for/fold ([nodes self-set]) ([arg (in-list args)])
+         (sorted-index-union nodes (recurse arg)))]
+      [_ self-set]))
+  (define reachable-mask (block-recurse block node-reachable-mask))
+  (define (dag-cost v recurse)
+    (define node (val-def v))
+    (match node
+      [(? number?) 0] ; specs
+      [(approx _ impl) (recurse impl)]
+      [(list (? (negate impl-exists?) _) args ...) 0] ; specs
+      [(list impl args ...) (sum-set (reachable-mask v))]
+      [_ (node-cost v)]))
+  (define (tree-cost v recurse)
+    (match (val-def v)
+      [(? number?) 0] ; specs
+      [(approx _ impl) (recurse impl)]
+      [(list (? (negate impl-exists?) _) args ...) 0] ; specs
+      [(list impl args ...) (+ (node-cost v) (for/sum ([arg (in-list args)]) (recurse arg)))]
+      [_ (node-cost v)]))
+  (block-recurse block (if (flag-set? 'reduce 'dag-cost) dag-cost tree-cost)))
+
+(define (make-alt-table block pcontext initial-alt)
+  (define cost ((alt-block-costs block) (alt-expr initial-alt)))
+  (define errs (first (block-errors block (list (alt-expr initial-alt)) pcontext)))
   (alt-table (for/vector #:length (pcontext-length pcontext)
-                         ([err (in-list errs)])
+                         ([err (in-flvector errs)])
                (list (pareto-point cost err (list initial-alt))))
              (hasheq initial-alt
                      (for/list ([idx (in-range (pcontext-length pcontext))])
@@ -72,15 +105,8 @@
   (andmap (curry hash-ref (alt-table-alt->done? atab)) (hash-keys (alt-table-alt->point-idxs atab))))
 
 ;;
-;; Extracting lists from sets or hash tables
-;; need to be treated with care:
-;;   - Internal hash tables and sets may cause
-;;     non-deterministic behavior in ordering.
-;;   - Need to sort to ensure some predictable order
-;;
-;; But why?? Still unclear.
-;; If the conversion from seteq or hasheq to list is guarded
-;; by sorting shouldn't everything else be deterministic???
+;; Hash/set iteration order is unspecified. Always sort extracted alternatives
+;; before iterating so search decisions do not depend on table iteration order.
 ;;
 (define (order-altns altns)
   (sort altns expr<? #:key alt-expr))
@@ -183,19 +209,19 @@
                [alt->done? (hash-remove* alt->done? altns)]
                [alt->cost (hash-remove* alt->cost altns)]))
 
-(define (atab-eval-altns atab altns ctx)
-  (define batch (progs->batch (map alt-expr altns) #:vars (context-vars ctx)))
-  (define errss (batch-errors batch (alt-table-pcontext atab) ctx))
-  (define costs (alt-batch-cost batch (context-repr ctx)))
+(define (atab-eval-altns atab block altns)
+  (define vs (map alt-expr altns))
+  (define errss (block-errors block vs (alt-table-pcontext atab)))
+  (define costs (map (alt-block-costs block) vs))
   (values errss costs))
 
-(define (atab-add-altns atab altns errss costs ctx)
+(define (atab-add-altns atab altns errss costs)
   (define atab*
     (for/fold ([atab atab])
               ([altn (in-list altns)]
                [errs (in-list errss)]
                [cost (in-list costs)])
-      (atab-add-altn atab altn errs cost ctx)))
+      (atab-add-altn atab altn errs cost)))
   (define atab**
     (struct-copy alt-table atab* [alt->point-idxs (invert-index (alt-table-point-idx->alts atab*))]))
   (define atab*** (atab-prune atab**))
@@ -214,30 +240,34 @@
       (hash-update! alt->points* alt (λ (v) (cons idx v)) '())))
   (make-immutable-hasheq (hash->list alt->points*)))
 
-(define (atab-add-altn atab altn errs cost ctx)
+(define (atab-add-altn atab altn errs cost)
   (match-define (alt-table point-idx->alts alt->point-idxs alt->done? alt->cost pcontext _) atab)
-  (define max-error (+ 1 (expt 2 (representation-total-bits (context-repr ctx)))))
+  ;; Check  whether altn is already inserted into atab
+  (match (hash-has-key? alt->point-idxs altn)
+    [#f
+     (define v (alt-expr altn))
+     (define max-valid-bits (representation-total-bits (block-repr-of v)))
+     (define point-idx->alts*
+       (for/vector #:length (vector-length point-idx->alts)
+                   ([pcurve (in-vector point-idx->alts)]
+                    [err (in-flvector errs)])
+         (cond
+           [(<= err max-valid-bits) ; Only include points if they are valid
+            (define ppt (pareto-point cost err (list altn)))
+            (pareto-union (list ppt) pcurve #:combine append)]
+           [else pcurve])))
 
-  (define point-idx->alts*
-    (for/vector #:length (vector-length point-idx->alts)
-                ([pcurve (in-vector point-idx->alts)]
-                 [err (in-list errs)])
-      (cond
-        [(< err max-error) ; Only include points if they are valid
-         (define ppt (pareto-point cost err (list altn)))
-         (pareto-union (list ppt) pcurve #:combine append)]
-        [else pcurve])))
-
-  (alt-table point-idx->alts*
-             (hash-set alt->point-idxs altn #f)
-             (hash-set alt->done? altn #f)
-             (hash-set alt->cost altn cost)
-             pcontext
-             #f))
+     (alt-table point-idx->alts*
+                (hash-set alt->point-idxs altn #f)
+                (hash-set alt->done? altn #f)
+                (hash-set alt->cost altn cost)
+                pcontext
+                #f)]
+    [_ atab]))
 
 (define (atab-min-errors atab)
   (define pnt-idx->alts (alt-table-point-idx->alts atab))
-  (for/list ([idx (in-range (pcontext-length (alt-table-pcontext atab)))])
-    (define curve (vector-ref pnt-idx->alts idx))
-    ;; Curve is sorted so lowest error is first
-    (pareto-point-error (first curve))))
+  (for/flvector #:length (pcontext-length (alt-table-pcontext atab))
+                ([curve (in-vector pnt-idx->alts)])
+                ;; Curve is sorted so lowest error is first
+                (pareto-point-error (first curve))))

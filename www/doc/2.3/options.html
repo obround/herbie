@@ -28,7 +28,7 @@
 
   <p>Herbie provides several subcommands, which offer interactive and
     batch modes for both the <a href="using-cli.html">command line</a>
-    and the <a href="using-web.html">web interface</a>:<p>
+    and the <a href="using-web.html">web interface</a>:</p>
 
   <dl>
     <dt><code>racket -l herbie web</code></dt>
@@ -206,6 +206,14 @@
     points</a>" error more often. Instead of turning this option off,
     try adjusting the <kbd>--num-analysis</kbd> flag.</dd>
 
+    <dt><code>setup:preprocess</code></dt>
+    <dd>This option, on by default, uses identities of the input
+    expression (like even or symmetric expressions) to perform
+    rewriting more effectively. If turned off, Herbie will skip
+    preprocessing and work directly with the original expression. This
+    can be faster but may produce less accurate results for
+    expressions with exploitable symmetries.</dd>
+
     <dt><code>generate:rr</code></dt>
     <dd>This option, on by default, uses algebraic rewriting to
     generate candidate programs. This is Herbie's primary method of
@@ -250,6 +258,12 @@
       expressions, not just variables. This slows Herbie down,
       particularly for large programs. If turned off, Herbie will only
       try to branch on variables.</dd>
+
+    <dt><code>reduce:dag-cost</code></dt>
+    <dd>This option, off by default, uses a more complex algorithm
+    when pruning. It slows Herbie down, particularly for large
+    programs. If turned on, Herbie will use more common subexpressions
+    and make more use of functions that return arrays.</dd>
   </dl>
 
 </body>

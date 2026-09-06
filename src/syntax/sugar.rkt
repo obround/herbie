@@ -6,7 +6,7 @@
 ;; FPCore: the input/output language
 ;;
 ;; - standardized interchange format with other tools
-;; - using loopless, tensorless subset
+;; - using a loopless subset with array literals
 ;; - operators denote real computations while rounding contexts decide format
 ;;
 ;;  <FPCore> ::= (FPCore (<var> ...) <props> ... <expr>)
@@ -57,16 +57,46 @@
 
 #lang racket
 
-(require "../core/programs.rkt"
-         "../utils/common.rkt"
+(require "../utils/common.rkt"
          "../utils/errors.rkt"
          "platform.rkt"
          "matcher.rkt"
          "syntax.rkt"
          "types.rkt")
 
-(provide fpcore->prog
+(provide fpcore->spec
+         fpcore->prog
+         spec->prog
          prog->fpcore)
+
+;; Local copies to avoid depending on core/programs.rkt.
+(define (repr-of expr ctx)
+  (match expr
+    [(literal _ precision) (get-representation precision)]
+    [(? symbol?) (context-lookup ctx expr)]
+    [(approx _ impl) (repr-of impl ctx)]
+    [(list op _ ...) (impl-info op 'otype)]))
+
+(define (replace-vars dict expr)
+  (let loop ([expr expr])
+    (match expr
+      [(? literal?) expr]
+      [(? number?) expr]
+      [(? symbol?) (dict-ref dict expr expr)]
+      [(approx impl spec) (approx (loop impl) (loop spec))]
+      [(list op args ...) (cons op (map loop args))])))
+
+(define (fpcore-extension-spec expr)
+  (define specs
+    (remove-duplicates (filter identity
+                               (for/list ([impl (in-list (platform-impls (*active-platform*)))])
+                                 (define-values (_ body) (impl->fpcore impl))
+                                 (define subst (pattern-match (expand-expr body) expr))
+                                 (and subst (pattern-substitute (impl-info impl 'spec) subst))))))
+  (match specs
+    ['() #f]
+    [(list spec) spec]
+    [_ (error 'fpcore->spec "ambiguous platform specs for `~a`: ~a" expr specs)]))
 
 ;; Expression pre-processing for normalizing expressions.
 ;; Used for conversion from FPCore to other IRs.
@@ -99,7 +129,8 @@
       [`(- ,a) `(neg ,(loop a env))]
       [`(/ ,a) `(/ 1 ,(loop a env))]
       ; expand arithmetic associativity
-      [`(,(and (or '+ '- '* '/ 'and 'or) op) ,as ..2 ,b) `(,op ,(loop `(,op ,@as) env) ,(loop b env))]
+      [`(,(and (or '+ '- '* '/ 'and 'or) op) ,as ..2 ,b)
+       (list op (loop `(,op ,@as) env) (loop b env))]
       ; expand comparison associativity
       [`(,(and (or '< '<= '> '>= '=) op) ,as ...)
        (define as* (map (curryr loop env) as))
@@ -125,23 +156,36 @@
                (list 'and out (list '!= term term2))
                (list '!= term term2))))
        (or out '(TRUE))]
-      ; function calls
-      [(list (? (curry hash-has-key? (*functions*)) fname) args ...)
-       (match-define (list vars _ body) (hash-ref (*functions*) fname))
-       (define env*
-         (for/fold ([env* '()])
-                   ([var (in-list vars)]
-                    [arg (in-list args)])
-           (dict-set env* var (loop arg env))))
-       (loop body env*)]
       ; applications
       [`(,op ,args ...) `(,op ,@(map (curryr loop env) args))]
       ; constants
-      [(? operator-exists? op) (list expr)]
+      [(? operator-exists? op) (list op)]
       ; variables
       [(? symbol?) (dict-ref env expr expr)]
       ; other
       [_ expr])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; FPCore -> LSpec
+
+(define (fpcore->spec prog)
+  (let loop ([expr (expand-expr prog)])
+    (match expr
+      [(? number?)
+       (match expr
+         [(or +inf.0 -inf.0 +nan.0) expr]
+         [(? exact?) expr]
+         [_ (inexact->exact expr)])]
+      [(? symbol?) expr]
+      [(list '! _ ... body) (loop body)]
+      [(list 'cast arg) (loop arg)]
+      [(list op args ...)
+       (define args* (map loop args))
+       (define expr* `(,op ,@args*))
+       (match (fpcore-extension-spec expr*)
+         [#f expr*]
+         [(== expr*) expr*]
+         [spec (loop spec)])])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; FPCore -> LImpl
@@ -156,15 +200,12 @@
 
 ;; Translates an FPCore operator application into
 ;; an LImpl operator application.
-(define (fpcore->impl-app op prop-dict args ctx)
+(define (impl-app op prop-dict args ctx)
   (define ireprs (map (lambda (arg) (repr-of arg ctx)) args))
   (define impl (assert-fpcore-impl op prop-dict ireprs))
   (define vars (impl-info impl 'vars))
-  (define pattern
-    (match (impl-info impl 'fpcore)
-      [(list '! _ ... body) body]
-      [body body]))
-  (define subst (pattern-match pattern (cons op args)))
+  (define-values (_ body) (impl->fpcore impl))
+  (define subst (pattern-match body (cons op args)))
   (pattern-substitute (cons impl vars) subst))
 
 ;; Translates from FPCore to an LImpl.
@@ -186,26 +227,51 @@
                  prop-dict))]
       [(list 'neg arg) ; non-standard but useful [TODO: remove]
        (define arg* (loop arg prop-dict))
-       (fpcore->impl-app '- prop-dict (list arg*) ctx)]
+       (impl-app '- prop-dict (list arg*) ctx)]
       [(list 'cast arg) ; special case: unnecessary casts
        (define arg* (loop arg prop-dict))
        (define repr (get-representation (dict-ref prop-dict ':precision)))
        (if (equal? (repr-of arg* ctx) repr)
            arg*
-           (fpcore->impl-app 'cast prop-dict (list arg*) ctx))]
+           (impl-app 'cast prop-dict (list arg*) ctx))]
+      [(list 'ref arr idx)
+       (define arr* (loop arr prop-dict))
+       (define idx* (loop idx prop-dict))
+       (define arr-repr (repr-of arr* ctx))
+       (define idx-repr (repr-of idx* ctx))
+       (define impl (assert-fpcore-impl 'ref prop-dict (list arr-repr idx-repr)))
+       (define vars (impl-info impl 'vars))
+       (define-values (_ body) (impl->fpcore impl))
+       (define subst (pattern-match body (list 'ref arr* idx*)))
+       (pattern-substitute (cons impl vars) subst)]
       [(list op args ...)
        (define args* (map (lambda (arg) (loop arg prop-dict)) args))
-       (fpcore->impl-app op prop-dict args* ctx)])))
+       (impl-app op prop-dict args* ctx)])))
+
+;; Translates from LSpec to an LImpl.
+(define (spec->prog prog ctx)
+  (define prop-dict (repr->prop (context-repr ctx)))
+  (let loop ([expr prog])
+    (match expr
+      [(? number?)
+       (literal (match expr
+                  [(or +inf.0 -inf.0 +nan.0) expr]
+                  [(? exact?) expr]
+                  [_ (inexact->exact expr)])
+                (dict-ref prop-dict ':precision))]
+      [(? symbol?) expr]
+      [(list 'neg arg) (impl-app '- prop-dict (list (loop arg)) ctx)]
+      [(list op args ...) (impl-app op prop-dict (map loop args) ctx)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; LImpl -> FPCore
 ;; Translates from LImpl to an FPCore
 
-;; TODO: this process uses a batch-like data structure
+;; TODO: this process uses a block-like data structure
 ;; but _without_ deduplication since different use sites
 ;; of a particular subexpression may have different
 ;; parent rounding contexts. Would be nice to explore
-;; if the batch data structure can be used.
+;; if the block data structure can be used.
 
 ;; Instruction vector index
 (struct index (v) #:prefab)
@@ -215,7 +281,12 @@
   (match x
     [(literal -inf.0 _) '(- INFINITY)]
     [(literal +inf.0 _) 'INFINITY]
-    [(literal v (or 'binary64 'binary32)) (exact->inexact v)]
+    [(literal v (or 'binary64 'binary32))
+     (define v* (exact->inexact v))
+     (cond
+       [(equal? v* +inf.0) 'INFINITY]
+       [(equal? v* -inf.0) '(- INFINITY)]
+       [else v*])]
     [(literal v _) v]))
 
 ;; Step 1.
@@ -238,7 +309,6 @@
       [(? number?) expr]
       [(? symbol?) expr]
       [(approx _ impl) (munge impl)]
-      [(hole _ spec) (munge spec)]
       [(list (? impl-exists? impl) args ...)
        (define args* (map munge args))
        (define vars (impl-info impl 'vars))
@@ -278,7 +348,8 @@
                   prop-dict))
             (assert-fpcore-impl op prop-dict* (impl-info impl 'itype))]
            ; rounding context inherited from parent context
-           [(list op _ ...) (assert-fpcore-impl op prop-dict (impl-info impl 'itype))]))
+           [(or (? symbol? op) (list op _ ...))
+            (assert-fpcore-impl op prop-dict (impl-info impl 'itype))]))
        (cond
          [(equal? impl impl*) ; inlining is safe
           (define expr* (loop expr prop-dict))
@@ -291,13 +362,13 @@
       [(list '! props ... body) ; explicit rounding context
        (define prop-dict* (props->dict props))
        (define body* (loop body prop-dict*))
-       (define new-prop-dict
+       (define new-props
          (for/list ([(k v) (in-dict prop-dict*)]
                     #:unless (and (dict-has-key? prop-dict k) (equal? (dict-ref prop-dict k) v)))
-           (cons k v)))
-       (if (null? new-prop-dict)
+           (list k v)))
+       (if (null? new-props)
            body*
-           `(! ,@(dict->props new-prop-dict) ,body*))]
+           `(! ,@(append* new-props) ,body*))]
       [(list op args ...) ; operator application
        (define args* (map (lambda (e) (loop e prop-dict)) args))
        `(,op ,@args*)])))
@@ -343,9 +414,9 @@
   (define reachable (reachable-indices ivec expr))
   (define id->name (make-hash))
   (for ([expr (in-vector ivec)]
-        [idx (in-naturals)])
-    (when (and expr (set-member? reachable idx))
-      (hash-set! id->name idx (gensym))))
+        [idx (in-naturals)]
+        #:when (and expr (set-member? reachable idx)))
+    (hash-set! id->name idx (gensym)))
 
   (for/fold ([body (remove-indices id->name expr)]) ([idx (in-list (sort (hash-keys id->name) >))])
     (define var (hash-ref id->name idx))

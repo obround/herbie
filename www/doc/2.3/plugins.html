@@ -52,8 +52,7 @@
 
   <p>Create representations with <code>make-representation</code>:</p>
 
-  <code>
-  <table>
+  <table class="function-list">
     <tr><td colspan=2>(<b>make-representation</b></td></tr>
     <tr><td></td><td>#:name <var>name</var></td></tr>
     <tr><td></td><td>#:total-bits <var>width</var></td></tr>
@@ -63,10 +62,9 @@
     <tr><td></td><td>#:repr->ordinal <var>repr->ordinal</var></td></tr>
     <tr><td></td><td>#:special-value? <var>special?</var>)</td></tr>
   </table>
-  </code>
 
   <p>The <code>#:name</code> should be either a symbol, or a list
-  containing symbols and integers. The <code>#:total-bits<code> value
+  containing symbols and integers. The <code>#:total-bits</code> value
   should be a positive integer. The <code>#:total-bits</code>
   parameter determines the total ordinal range your format takes up,
   not just its significand range, so for example for double-precision
@@ -114,21 +112,22 @@
   <h2>Defining Generators</h2>
 
   <p><dfn>Generators</dfn> are helper functions for generating
-  implementations in <code>define-operation</code>. For
-  example, <a href="platforms.html"><code>from-libm</code>
-  and <code>from-rival</code></a> are generators.</p>
+  implementations in <code>define-operation</code>. For example,
+  <a href="platforms.html"><code>from-ffi</code></a> is a
+  generator.</p>
 
   <p>To define a generator, use <code>define-generator</code>:</p>
 
-  <code><table>
+  <table class="function-list">
   <tr><td colspan=2>(<b>define-generator</b> ((from-<var>foo</var> <var>args</var> ...) spec ctx)</td></tr>
   <tr><td></td><td><var>body</var> ...)</td></tr>
-  </table></code>
+  </table>
 
   <p>Here, <code>from-<var>foo</var></code> is the name of your
   generator, and <var>args</var> are any additional arguments the
   generator takes. For example, <code>from-libm</code> takes one
-  argument, the symbol name.</p>
+  argument, the symbol name, while <code>from-ffi</code> takes an open
+  library and a symbol name.</p>
 
   <p>Then, inside the <var>body</var>, you can use those arguments as
   well as <code>spec</code> and <code>ctx</code>, to construct an
@@ -142,7 +141,7 @@
   representation, its <code>context-vars</code> to access its variable
   names (as a list of symbols), and its <code>context-var-reprs</code>
   to access its input representations (as a parallel list of
-  representations). The <code>context-lookup<code> function can be
+  representations). The <code>context-lookup</code> function can be
   used to look up a input argument's representation by name.</p>
 
 </body>

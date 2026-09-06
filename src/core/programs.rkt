@@ -4,7 +4,7 @@
          "../syntax/syntax.rkt"
          "../syntax/platform.rkt"
          "../syntax/types.rkt"
-         "batch.rkt")
+         "../syntax/block.rkt")
 
 (provide expr?
          expr<?
@@ -14,15 +14,13 @@
          impl-prog?
          node-is-impl?
          repr-of
-         repr-of-node
-         location-set
-         location-get
+         block-repr-of
          get-locations
          free-variables
          replace-expression
-         replace-vars
-         batch-get-locations
-         batch-location-set)
+         block-replace-expression!
+         block-replace-subexpr
+         replace-vars)
 
 ;; Programs are just lisp lists plus atoms
 
@@ -41,18 +39,17 @@
     [(literal val precision) (get-representation precision)]
     [(? symbol?) (context-lookup ctx expr)]
     [(approx _ impl) (repr-of impl ctx)]
-    [(hole precision spec) (get-representation precision)]
     [(list op args ...) (impl-info op 'otype)]))
 
-; Index inside (batch-nodes batch) -> type
-(define (repr-of-node batch idx ctx)
-  (define node (batch-ref batch idx))
-  (match node
-    [(literal val precision) (get-representation precision)]
-    [(? symbol?) (context-lookup ctx node)]
-    [(approx _ impl) (repr-of-node batch impl ctx)]
-    [(hole precision spec) (get-representation precision)]
-    [(list op args ...) (impl-info op 'otype)]))
+(define (block-repr-of v)
+  (define block (val-block v))
+  (define var-reprs (map cons (block-vars block) (block-var-reprs block)))
+  (let loop ([v v])
+    (match (val-def v)
+      [(literal val precision) (get-representation precision)]
+      [(? symbol? node) (dict-ref var-reprs node)]
+      [(approx _ impl) (loop impl)]
+      [(list op args ...) (impl-info op 'otype)])))
 
 (define (all-subexpressions expr #:reverse? [reverse? #f])
   (define subexprs
@@ -100,6 +97,9 @@
 
 (define (expr-cmp a b)
   (match* (a b)
+    [((? val?) (? val?)) (expr-cmp (val-def a) (val-def b))]
+    [((? val?) _) (expr-cmp (val-def a) b)]
+    [(_ (? val?)) (expr-cmp a (val-def b))]
     [((? list?) (? list?))
      (define len-a (length a))
      (define len-b (length b))
@@ -125,13 +125,6 @@
          cmp-spec)]
     [((? approx?) _) 1]
     [(_ (? approx?)) -1]
-    [((? hole?) (? hole?))
-     (define cmp-spec (expr-cmp (hole-spec a) (hole-spec b)))
-     (if (zero? cmp-spec)
-         (expr-cmp (hole-precision a) (hole-precision b))
-         cmp-spec)]
-    [((? hole?) _) 1]
-    [(_ (? hole?)) -1]
     [((? symbol?) (? symbol?))
      (cond
        [(symbol<? a b) -1]
@@ -169,48 +162,6 @@
       [(approx impl spec) (approx (loop impl) (loop spec))]
       [(list op args ...) (cons op (map loop args))])))
 
-(define location? (listof natural-number/c))
-
-(define (location-do loc prog f)
-  (match* (prog loc)
-    [(_ (? null?)) (f prog)]
-    [((approx spec impl) (cons 1 rest)) (approx (location-do rest spec f) impl)]
-    [((approx spec impl) (cons idx rest)) (approx spec (location-do rest impl f))]
-    [((hole prec spec) (cons 1 rest)) (hole prec (location-do rest spec f))]
-    [((? list?) (cons idx rest)) (list-set prog idx (location-do rest (list-ref prog idx) f))]))
-
-(define/contract (location-set loc prog prog*)
-  (-> location? expr? expr? expr?)
-  (location-do loc prog (const prog*)))
-
-(define/contract (batch-location-set loc0 full-batchref sub-batchref)
-  (-> location? batchref? batchref? batchref?)
-  (match-define (batchref sub-batch sub-idx) sub-batchref)
-  (match-define (batchref full-batch full-idx) full-batchref)
-
-  (unless (equal? sub-batch full-batch)
-    (error 'batch-location-set "Function assumes that batches are equal"))
-
-  (define idx*
-    (let loop ([loc0 loc0]
-               [idx full-idx])
-      (let ([node (batch-ref full-batch idx)])
-        (match* (node loc0)
-          [(_ (? null?)) sub-idx]
-          [((approx spec impl) (cons 1 rest)) (batch-push! full-batch (approx (loop rest spec) impl))]
-          [((approx spec impl) (cons 2 rest)) (batch-push! full-batch (approx spec (loop rest impl)))]
-          [((hole prec spec) (cons 1 rest)) (batch-push! full-batch (hole prec (loop rest spec)))]
-          [((list op args ...) (cons loc rest))
-           (define args* (list-update args (sub1 loc) (curry loop rest)))
-           (batch-push! full-batch (cons op args*))]))))
-  (batchref full-batch idx*))
-
-(define/contract (location-get loc prog)
-  (-> location? expr? expr?)
-  ; Clever continuation usage to early-return
-  (let/ec return
-    (location-do loc prog return)))
-
 (define (get-locations expr subexpr)
   (reap [sow]
         (let loop ([expr expr]
@@ -225,38 +176,6 @@
                    [i (in-naturals 1)])
                (loop arg (cons i loc)))]))))
 
-(define (batch-get-locations full-batchref sub-batchref)
-  (match-define (batchref full-batch full-idx) full-batchref)
-  (match-define (batchref sub-batch sub-idx) sub-batchref)
-  (unless (equal? sub-batch full-batch)
-    (error 'batch-get-locations "Function assumes that batches are equal"))
-
-  (define (locations-update locations prev-idx new-loc new-idx)
-    (define prev-locs (vector-ref locations prev-idx))
-    (unless (null? prev-locs) ; when prev-idx has some locs stored
-      (define new-locs (map (curry cons new-loc) prev-locs)) ; append prev-locs with new-loc
-      (vector-set! locations
-                   new-idx
-                   (append (vector-ref locations new-idx) new-locs)))) ; update new-locs at new-idx
-
-  (cond
-    [(> sub-idx full-idx)
-     '()] ; sub-idx can not be a child of full-idx if it is inserted after full-idx
-    [else
-     (define locations (make-vector (batch-length full-batch) '()))
-     (vector-set! locations sub-idx '(()))
-     (for ([node (in-batch full-batch (add1 sub-idx) (add1 full-idx))]
-           [n (in-naturals (add1 sub-idx))])
-       (match node
-         [(list _ args ...)
-          (for ([arg (in-list args)]
-                [i (in-naturals 1)])
-            (locations-update locations arg i n))]
-         [(approx _ impl) (locations-update locations impl 2 n)]
-         [(hole _ spec) (locations-update locations spec 1 n)]
-         [_ void])) ; literal/number/symbol
-     (vector-ref locations full-idx)]))
-
 (define/contract (replace-expression expr from to)
   (-> expr? expr? expr? expr?)
   (let loop ([expr expr])
@@ -267,6 +186,59 @@
       [(? symbol?) expr]
       [(approx spec impl) (approx (loop spec) (loop impl))]
       [(list op args ...) (cons op (map loop args))])))
+
+(define (block-replace-expression! block from to)
+  (define from* (val-def (block-add! block from))) ;; a hack on how not to use val-def for "from"
+  (define (f node)
+    (match node
+      [(== from*) to]
+      [(? number?) node]
+      [(? literal?) node]
+      [(? symbol?) node]
+      [(approx spec impl) (approx spec impl)]
+      [(list op args ...) (cons op args)]))
+  (block-recurse block
+                 (λ (v recurse)
+                   (define node (val-def v))
+                   (define node* (f node))
+                   (let loop ([node* node*])
+                     (match node*
+                       [(? val? v) (recurse v)]
+                       [_ (block-push! block (expr-recurse node* (compose val-idx loop)))])))))
+
+;; Replace all occurrences of `from` with `to` in expression `expr`, returning a new val
+;; Only recurses into impl parts, not specs
+(define (block-replace-subexpr block expr from to [can-refer #f])
+  (define cache (make-hasheq))
+  (define from-idx (val-idx from))
+  (let loop ([v expr])
+    (define idx (val-idx v))
+    (cond
+      [(< idx from-idx) v]
+      [(= idx from-idx) to]
+      [(and can-refer (not (set-member? can-refer idx))) v]
+      [else
+       (hash-ref! cache
+                  idx
+                  (lambda ()
+                    (match (val-def v)
+                      [(approx spec impl)
+                       (define impl* (loop impl))
+                       (if (= (val-idx impl*) (val-idx impl))
+                           v
+                           (block-push! block (approx spec (val-idx impl*))))]
+                      [node
+                       (define unchanged? #t)
+                       (define node*
+                         (expr-recurse node
+                                       (lambda (arg)
+                                         (define arg* (loop arg))
+                                         (unless (= (val-idx arg*) (val-idx arg))
+                                           (set! unchanged? #f))
+                                         (val-idx arg*))))
+                       (if unchanged?
+                           v
+                           (block-push! block node*))])))])))
 
 (module+ test
   (require rackunit)

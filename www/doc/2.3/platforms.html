@@ -101,7 +101,7 @@
   <h2>Defining Representations</h2>
 
   <p>The typical platform starts by defining the representations it
-  uses and their costs with <code>define-representation<code>:</p>
+  uses and their costs with <code>define-representation</code>:</p>
 
   <pre>(define-representation &lt;bool&gt; #:cost 1)
 (define-representation &lt;binary64&gt; #:cost 1.5)</pre>
@@ -214,12 +214,22 @@
   <pre>(define-operation (fabs.f32 [x &lt;binary32&gt;]) &lt;binary32&gt;
   #:spec (fabs x) #:impl (from-libm 'fabsf) #:cost 0.125)</pre>
 
-  <p>The <code>from-libm</code> uses dynamic linking to
-  load <code>libm</code>, extracts the symbol passed
-  to <code>from-libm</code>, and then uses the operation's signature
-  to call into the dynamically-linked library from Racket. Must make
-  sure to pass the correct symbol name; for single-precision
-  functions, make sure to add the "<code>f</code>" suffix.</p>
+  <p>The <code>from-libm</code> helper uses dynamic linking to load
+  <code>libm</code>, extracts the symbol passed to
+  <code>from-libm</code>, and then uses the operation's signature to
+  call into the dynamically-linked library from Racket. Be sure to
+  pass the correct symbol name; for single-precision functions, add the
+  "<code>f</code>" suffix.</p>
+
+  <p>For other libraries, open them with
+  <code>ffi-lib</code> and use <code>from-ffi</code>, which
+  generalizes <code>from-libm</code>. For example, to load functions
+  from the GNU Scientific Library:</p>
+
+  <pre>(require ffi/unsafe)
+(define libgsl (ffi-lib "gsl"))
+(define-operation (cos.gsl [x &lt;binary64&gt;]) &lt;binary64&gt;
+  #:spec (cos x) #:impl (from-ffi libgsl 'gsl_sf_cos) #:cost 0.125)</pre>
 
   <h3>Numeric Variations</h3>
 
@@ -261,7 +271,7 @@
 
   <p>Comparison operations return <code>&lt;bool&gt;</code>:</p>
 
-  <pre>(define-operations ([x &lt;binary64&gt;] [y &lt;binary64&gt;]) <bool>
+  <pre>(define-operations ([x &lt;binary64&gt;] [y &lt;binary64&gt;]) &lt;bool&gt;
   [==.f64 #:spec (== x y) #:impl =          #:cost 1]
   [!=.f64 #:spec (!= x y) #:impl (negate =) #:cost 1]
   [&lt;.f64  #:spec (&lt; x y)  #:impl &lt;          #:cost 1]
@@ -287,7 +297,7 @@
 
   <p>Conditionals can be defined as operations with a boolean argument:</p>
 
-  <pre>(define-operation (if-f64 [c <bool>] [t &lt;binary64&gt;] [f &lt;binary64&gt;]) &lt;binary64&gt;
+  <pre>(define-operation (if-f64 [c &lt;bool&gt;] [t &lt;binary64&gt;] [f &lt;binary64&gt;]) &lt;binary64&gt;
   #:spec (if c t f) #:impl if-impl
   #:cost (if-cost 14) )</pre>
 
@@ -390,7 +400,7 @@
   implement accurately. In this case, Herbie's <code>from-rival</code>
   helper can provide a slow but correctly-rounded implementation:</p>
 
-  <pre>(define-opertion (dotprod [a &lt;binary64&gt;] [b &lt;binary64&gt;]
+  <pre>(define-operation (dotprod [a &lt;binary64&gt;] [b &lt;binary64&gt;]
                             [c &lt;binary64&gt;] [d &lt;binary64&gt;]) &lt;binary64&gt;
   #:spec (+ (* a b) (* c d)) #:impl (from-rival) #:cost 1.25)</pre>
 
@@ -399,7 +409,10 @@
   operation's specification. Compilation is usually <em>much</em>
   slower than with a native floating-point implementation, but for
   unusual operations that are difficult to implement otherwise, it can
-  still allow compilation to proceed.</p>
+  still allow compilation to proceed. There is an
+  optional <code>#:cache?</code> argument to <code>from-rival</code>,
+  on by default. The cache makes Herbie much faster but uses a lot of
+  memory.</p>
 
   <p>Note that <code>from-rival</code> implementations are always
   "correctly-rounded", meaning as accurate as possible. Most targets

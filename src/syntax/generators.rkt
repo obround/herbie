@@ -4,10 +4,13 @@
          math/bigfloat
          ffi/unsafe)
 
-(require "../core/rival.rkt"
-         "types.rkt")
+(require "rival.rkt"
+         "../config.rkt"
+         "types.rkt"
+         "block.rkt")
 
 (provide from-rival
+         from-ffi
          from-libm
          from-bigfloat
          define-generator
@@ -23,24 +26,37 @@
 
 ; ----------------------- RIVAL GENERATOR ---------------------------
 
-(define-generator ((from-rival) spec ctx)
-  (define compiler (make-real-compiler (list spec) (list ctx)))
+(define/reset caches
+              '()
+              (lambda ()
+                (for ([cache (caches)])
+                  (hash-clear! cache))))
+
+(define-generator ((from-rival #:cache? [cache? #t]) spec ctx)
+  (define-values (block vs) (progs->block (list spec) #:ctx ctx))
+  (define compiler (make-real-compiler block vs (list (context-repr ctx))))
   (define fail ((representation-bf->repr (context-repr ctx)) +nan.bf))
-  (lambda pt
+  (define (compute . pt)
     (define-values (_ exs) (real-apply compiler (list->vector pt)))
     (if exs
         (first exs)
-        fail)))
+        fail))
+  (cond
+    [cache?
+     (define cache (make-hash))
+     (caches (cons cache (caches)))
+     (lambda pt (hash-ref! cache pt (lambda () (apply compute pt))))]
+    [else compute]))
 
-; ----------------------- LIBM GENERATOR ----------------------------
+; ----------------------- FFI GENERATOR -----------------------------
 
 ;; Looks up a function `name` with type signature `itype -> ... -> otype`
-;; in the system libm and returns the FFI function or `#f` if
-;; the procedure cannot be found.
+;; in the given FFI library and returns the function or `#f` if it
+;; cannot be found.
 ;; ```
-;; (make-libm (<name> <itype> ... <otype))
+;; (make-ffi <lib> (<name> <itype> ... <otype>))
 ;; ```
-(define (make-libm name itypes otype)
+(define (make-ffi lib name itypes otype)
   ; Repr matching
   (define (repr->ffi repr)
     (match (representation-name repr)
@@ -48,15 +64,17 @@
       ['binary32 _float]
       ['integer _int]
       [else (raise-syntax-error 'repr->type "unknown type" repr)]))
-  (get-ffi-obj name #f (_cprocedure (map repr->ffi itypes) (repr->ffi otype)) (const #f)))
+  (get-ffi-obj name lib (_cprocedure (map repr->ffi itypes) (repr->ffi otype)) (const #f)))
 
-(define-generator ((from-libm name) spec ctx)
+(define-generator ((from-ffi lib name) spec ctx)
   (let ([itypes (context-var-reprs ctx)]
         [otype (context-repr ctx)])
-    (define fl (make-libm name itypes otype))
-    (unless fl
-      (error 'libm-generator "Could not find libm implementation of `~a ~a ~a`" otype name itypes))
-    fl))
+    (or (make-ffi lib name itypes otype)
+        (error 'ffi-generator "Could not find FFI implementation of `~a ~a ~a`" otype name itypes))))
+
+(define libm-lib (ffi-lib #f))
+(define (from-libm name)
+  (from-ffi libm-lib name))
 
 ; ----------------------- BIGFLOAT GENERATOR ------------------------
 

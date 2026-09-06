@@ -1,28 +1,44 @@
 #lang racket
 
-(require "../utils/alternative.rkt"
+(require "../core/alternative.rkt"
+         "../syntax/block.rkt"
+         "../syntax/platform.rkt"
          "programs.rkt"
          "egg-herbie.rkt"
-         "../config.rkt")
+         "../config.rkt"
+         "../syntax/syntax.rkt")
 
 (provide add-derivations)
 
-(define (canonicalize-proof prog proof loc)
-  ;; Proofs are actually on subexpressions,
-  ;; we need to construct the proof for the full expression
-  (and proof (map (curry location-set loc prog) proof)))
+(define (copy-proof-specs spec-block expr)
+  (match expr
+    [(approx spec impl) (approx (block-add! spec-block spec) (copy-proof-specs spec-block impl))]
+    [(list op args ...) (cons op (map (curry copy-proof-specs spec-block) args))]
+    [_ expr]))
+
+(define (canonicalize-proof block spec-block prog-v proof start-v)
+  ;; Proofs are on subexpressions; lift to full expression
+  ;; Returns a list of vals instead of expressions
+  (and proof
+       (for/list ([step (in-list proof)])
+         (define step-v (block-add! block (copy-proof-specs spec-block step)))
+         (block-replace-subexpr block prog-v start-v step-v))))
 
 ;; Adds proof information to alternatives.
+;; start-expr and end-expr are vals
 (define (add-derivations-to altn)
   (match altn
     ; recursive rewrite or simplify, both using egg
-    [(alt expr (list 'rr loc (? egg-runner? runner) #f) `(,prev))
-     (define start-expr (location-get loc (alt-expr prev)))
-     (define end-expr (location-get loc expr))
+    ; start-v and end-v are vals for the subexpressions that were transformed
+    [(alt expr (list 'rr start-v end-v (? egg-runner? runner) #f) `(,prev))
+     (define block (val-block expr))
+     (define spec-block (egg-runner-block runner))
+     (define-values (proof-start proof-end)
+       (apply values (block-to-spec! block spec-block (list start-v end-v))))
      (define proof
-       (and (not (flag-set? 'generate 'egglog)) (egraph-prove runner start-expr end-expr)))
-     (define proof* (canonicalize-proof (alt-expr altn) proof loc))
-     (alt expr `(rr ,loc ,runner ,proof*) (list prev))]
+       (and (not (flag-set? 'generate 'egglog)) (egraph-prove runner proof-start proof-end)))
+     (define proof* (canonicalize-proof block spec-block (alt-expr altn) proof start-v))
+     (alt expr `(rr ,start-v ,end-v ,runner ,proof*) (list prev))]
 
     ; everything else
     [_ altn]))

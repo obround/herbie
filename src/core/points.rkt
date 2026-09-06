@@ -1,8 +1,10 @@
 #lang racket
 
-(require "../utils/float.rkt"
+(require math/flonum
+         "../syntax/float.rkt"
          "../syntax/types.rkt"
-         "batch.rkt"
+         "../syntax/block.rkt"
+         "programs.rkt"
          "compiler.rkt")
 
 (provide in-pcontext
@@ -11,9 +13,11 @@
          pcontext?
          pcontext-points
          split-pcontext
+         pcontext-append
          pcontext-length
          errors
-         batch-errors
+         block-errors
+         exprs-errors
          errors-score)
 
 ;; pcontexts are Herbie's standard data structure for storing
@@ -49,36 +53,45 @@
   (define-values (exs-a exs-b) (vector-split-at exs num-a))
   (values (pcontext pts-a exs-a) (pcontext pts-b exs-b)))
 
+(define (pcontext-append pctx1 pctx2)
+  (pcontext (vector-append (pcontext-points pctx1) (pcontext-points pctx2))
+            (vector-append (pcontext-exacts pctx1) (pcontext-exacts pctx2))))
+
 ;; Herbie's standard error measure is the average bits of error across
 ;; all points in a pcontext.
 
-(define (average . s)
-  (/ (apply + s) (length s)))
-
 (define (errors-score e)
-  (apply average (map ulps->bits e)))
+  (/ (flvector-sum e) (flvector-length e)))
 
 (define (errors expr pcontext ctx)
-  (first (batch-errors (list expr) pcontext ctx)))
+  (first (exprs-errors (list expr) pcontext ctx)))
 
-(define (batch-errors exprs pcontext ctx)
+(define (exprs-errors exprs pcontext ctx)
   (define fn (compile-progs exprs ctx))
-  (define repr (context-repr ctx))
-  (define special? (representation-special-value? repr))
-  (define max-error (+ 1 (expt 2 (representation-total-bits repr))))
+  (define num-exprs (length exprs))
+  (generate-errors fn pcontext (context-repr ctx) num-exprs))
 
-  ;; This generates the errors array in reverse because that's how lists work
-  (define num-exprs
-    (if (batch? exprs)
-        (vector-length (batch-roots exprs))
-        (length exprs)))
+(define (block-errors block vs pcontext)
+  (define fn (compile-block block vs))
+  (define num-exprs (length vs))
+  (generate-errors fn pcontext (block-repr-of (first vs)) num-exprs))
+
+(define (generate-errors fn pcontext repr num-exprs)
+  (define ulps (repr-ulps repr))
+  (define max-ulps (+ 1 (expt 2 (representation-total-bits repr))))
+  (define invalid-bits (real->double-flonum (representation-total-bits repr)))
   (define num-points (pcontext-length pcontext))
-  (for/fold ([result (make-list num-exprs '())])
-            ([point (in-vector (pcontext-points pcontext) (- num-points 1) -1 -1)]
-             [exact (in-vector (pcontext-exacts pcontext) (- num-points 1) -1 -1)])
-    (for/list ([out (in-vector (fn point))]
-               [rest (in-list result)])
-      (cons (if (special? out)
-                max-error
-                (ulp-difference out exact repr))
-            rest))))
+  (define results (build-vector num-exprs (lambda (_) (make-flvector num-points invalid-bits))))
+  (for ([point (in-vector (pcontext-points pcontext))]
+        [exact (in-vector (pcontext-exacts pcontext))]
+        [pidx (in-naturals)])
+    (define outs (fn point))
+    (for ([out (in-vector outs)]
+          [result (in-vector results)])
+      (define err-ulps (ulps out exact))
+      (flvector-set! result
+                     pidx
+                     (if (= err-ulps max-ulps)
+                         invalid-bits
+                         (ulps->bits err-ulps)))))
+  (vector->list results))

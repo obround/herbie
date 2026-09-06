@@ -1,21 +1,22 @@
 #lang racket
 
-(require profile
-         racket/engine
+(require racket/engine
+         math/flonum
          json)
 
 (require "../syntax/read.rkt"
+         "../syntax/platform-state.rkt"
          "../syntax/syntax.rkt"
          "../syntax/sugar.rkt"
          "../syntax/types.rkt"
          "../syntax/load-platform.rkt"
+         "../syntax/block.rkt"
          "../core/localize.rkt"
-         "../utils/alternative.rkt"
+         "../core/alternative.rkt"
          "../core/compiler.rkt"
          "../utils/common.rkt"
          "datafile.rkt"
          "../utils/errors.rkt"
-         "../utils/float.rkt"
          "../core/sampling.rkt"
          "../core/mainloop.rkt"
          "../syntax/platform.rkt"
@@ -57,13 +58,27 @@
 
 ;; API Functions
 
+;; Sampling a test more than once should reuse its block.
+(define (make-sampler test)
+  (define-values (block vs) (progs->block (list (test-spec test)) #:ctx (*context*)))
+  (lambda ([precondition (test-pre test)] [count (+ (*num-points*) (*reeval-pts*))])
+    (define sample
+      (parameterize ([*num-points* count])
+        (sample-points precondition block vs (list (context-repr (*context*))))))
+    (apply mk-pcontext sample)))
+
 ;; The main Herbie function
-(define (get-alternatives test joint-pcontext)
+(define (get-alternatives test joint-pcontext #:sampler [sampler #f])
   (unless joint-pcontext
     (error 'get-alternatives "cannnot run without a pcontext"))
 
   (define-values (train-pcontext test-pcontext) (partition-pcontext joint-pcontext))
-  (define alternatives (run-improve! (test-input test) (test-spec test) (*context*) train-pcontext))
+  (define initial-expr
+    (if (equal? (prog->spec (test-input test)) (test-spec test))
+        (test-input test)
+        (approx (test-spec test) (test-input test))))
+  (define alternatives
+    (run-improve! initial-expr (test-spec test) (*context*) train-pcontext #:sampler sampler))
 
   ;; compute error/cost for input expression
   (define start-expr (test-input test))
@@ -81,19 +96,14 @@
       (alt-analysis (make-alt target-expr) target-errs)))
 
   ;; compute error/cost for output expression
-  ;; and sort alternatives by accuracy + cost on testing subset
-  (define test-errs (batch-errors (map alt-expr alternatives) test-pcontext (*context*)))
-  (define sorted-end-exprs (sort-alts alternatives test-errs))
-  (define end-exprs (map (compose alt-expr car) sorted-end-exprs))
-  (define end-errs (map cdr sorted-end-exprs))
+  (define end-errs (exprs-errors (map alt-expr alternatives) test-pcontext (*context*)))
   (define end-data (map alt-analysis alternatives end-errs))
 
   (improve-result test-pcontext start-alt-data target-alt-data end-data))
 
 (define (get-cost test)
   (define cost-proc (platform-cost-proc (*active-platform*)))
-  (define output-repr (context-repr (*context*)))
-  (cost-proc (test-input test) output-repr))
+  (cost-proc (test-input test)))
 
 (define (get-errors test pcontext)
   (unless pcontext
@@ -102,7 +112,7 @@
   (define-values (_ test-pcontext) (partition-pcontext pcontext))
   (define errs (errors (test-input test) test-pcontext (*context*)))
   (for/list ([(pt _) (in-pcontext test-pcontext)]
-             [err (in-list errs)])
+             [err (in-flvector errs)])
     (cons pt err)))
 
 (define (get-explanations test pcontext)
@@ -130,14 +140,25 @@
 
   (local-error-as-tree (test-input test) (*context*) pcontext))
 
+;; If the post-preprocessing region is unsamplable, rollback RNG to keep Herbie runs reproducible.
+(define (make-search-sampler test sample)
+  (lambda (precondition)
+    (define rng-state (pseudo-random-generator->vector (current-pseudo-random-generator)))
+    (with-handlers ([exn:fail:user:herbie:sampling?
+                     (lambda (_)
+                       (current-pseudo-random-generator (vector->pseudo-random-generator rng-state))
+                       (timeline-push! 'stop "no-search-sample" 1)
+                       #f)])
+      (sample `(and ,(test-pre test) ,precondition) (*num-points*)))))
+
 (define (get-sample test)
   (random) ;; Tick the random number generator, for backwards compatibility
-  (define specification (prog->spec (or (test-spec test) (test-input test))))
-  (define precondition (prog->spec (test-pre test)))
-  (define sample
-    (parameterize ([*num-points* (+ (*num-points*) (*reeval-pts*))])
-      (sample-points precondition (list specification) (list (*context*)))))
-  (apply mk-pcontext sample))
+  ((make-sampler test)))
+
+(define (get-improve test)
+  (random) ;; Tick the random number generator, for backwards compatibility
+  (define sample (make-sampler test))
+  (get-alternatives test (sample) #:sampler (make-search-sampler test sample)))
 
 ;;
 ;;  Public interface
@@ -167,14 +188,14 @@
       (match command
         ['improve
          (job-result command test 'timeout (*timeout*) (timeline-extract) #f (warning-log) #f)]
-        [_ (error 'run-herbie "command ~a timed out" command)])))
+        [_ (raise-arguments-error 'run-herbie "command timed out" "command" command)])))
 
   (define (compute-result)
     (parameterize ([*timeline-disabled* (not timeline?)])
       (define start-time (current-inexact-milliseconds))
       (reset!)
       (*context* (test-context test))
-      (activate-platform! (*platform-name*))
+      (activate-platform! (platform-serialize))
       (set! timeline (*timeline*))
       (when seed
         (set-seed! seed))
@@ -186,10 +207,10 @@
             ['cost (get-cost test)]
             ['errors (get-errors test pcontext)]
             ['explanations (get-explanations test pcontext)]
-            ['improve (get-alternatives test (get-sample test))]
+            ['improve (get-improve test)]
             ['local-error (get-local-error test pcontext)]
             ['sample (get-sample test)]
-            [_ (error 'compute-result "unknown command ~a" command)]))
+            [_ (raise-arguments-error 'compute-result "unknown command" "command" command)]))
         (timeline-event! 'end)
         (define time (- (current-inexact-milliseconds) start-time))
         (job-result command test 'success time (timeline-extract) #f (warning-log) result))))
@@ -197,22 +218,20 @@
   (define (in-engine _)
     (cond
       [profile?
-       (define result
-         (profile-thunk compute-result
-                        #:order 'total
-                        #:delay 0.05
-                        #:render (λ (p order) (set! profile (profile->json p)))))
+       (define result (profile-thunk compute-result (λ (p) (set! profile (profile->json p)))))
        (struct-copy job-result result [profile profile])]
       [else (compute-result)]))
 
-  ;; Branch on whether or not we should run inside an engine
-  (define eng (engine in-engine))
-  (if (engine-run (*timeout*) eng)
-      (engine-result eng)
-      (on-timeout)))
+  (define run-custodian (make-custodian))
+  (begin0 (parameterize ([current-custodian run-custodian])
+            (define eng (engine in-engine))
+            (if (engine-run (*timeout*) eng)
+                (engine-result eng)
+                (on-timeout)))
+    (custodian-shutdown-all run-custodian)))
 
 (define (dummy-table-row-from-hash result-hash status link)
-  (define test (car (load-tests (open-input-string (hash-ref result-hash 'test)))))
+  (define test (load-test (open-input-string (hash-ref result-hash 'test))))
   (define repr (test-output-repr test))
   (table-row (test-name test)
              (test-identifier test)
@@ -234,7 +253,7 @@
              '()))
 
 (define (get-table-data-from-hash result-hash link)
-  (define test (car (load-tests (open-input-string (hash-ref result-hash 'test)))))
+  (define test (load-test (open-input-string (hash-ref result-hash 'test))))
   (define backend (hash-ref result-hash 'backend))
   (define status (hash-ref result-hash 'status))
   (match status
@@ -242,19 +261,17 @@
      (define start (hash-ref backend 'start))
      (define targets (hash-ref backend 'target))
      (define end (hash-ref backend 'end))
-     (define expr-cost (platform-cost-proc (*active-platform*)))
-     (define repr (test-output-repr test))
 
      ; starting expr analysis
      (define start-expr (read (open-input-string (hash-ref start 'expr))))
-     (define start-score (errors-score (hash-ref start 'errors)))
+     (define start-score (errors-score (list->flvector (hash-ref start 'errors))))
      (define start-cost (hash-ref start 'cost))
 
      (define target-cost-score
        (for/list ([target targets])
          (define target-expr (read (open-input-string (hash-ref target 'expr))))
          (define tar-cost (hash-ref target 'cost))
-         (define tar-score (errors-score (hash-ref target 'errors)))
+         (define tar-score (errors-score (list->flvector (hash-ref target 'errors))))
 
          (list tar-cost tar-score)))
 
@@ -267,16 +284,22 @@
      (define end-exprs
        (for/list ([end-analysis (in-list end)])
          (read (open-input-string (hash-ref end-analysis 'expr)))))
+     (define end-expr-strings (map (curryr hash-ref 'expr) end))
      (define end-scores
        (for/list ([end-analysis (in-list end)])
-         (errors-score (hash-ref end-analysis 'errors))))
+         (errors-score (list->flvector (hash-ref end-analysis 'errors)))))
      (define end-costs (map (curryr hash-ref 'cost) end))
 
      ; terribly formatted pareto-optimal frontier
+     (define (round3 x)
+       (/ (round (* x 1000)) 1000.0))
      (define cost&accuracy
-       (list (list start-cost start-score)
-             (list (car end-costs) (car end-scores))
-             (map list (cdr end-costs) (cdr end-scores) (cdr end-exprs))))
+       (list (list (round3 start-cost) (round3 start-score))
+             (list (round3 (car end-costs)) (round3 (car end-scores)) (car end-expr-strings))
+             (map (λ (c s expr) (list (round3 c) (round3 s) expr))
+                  (cdr end-costs)
+                  (cdr end-scores)
+                  (cdr end-expr-strings))))
 
      (define fuzz 0.1)
      (define end-score (car end-scores))

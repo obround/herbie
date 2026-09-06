@@ -4,12 +4,12 @@
 (require "../utils/common.rkt"
          "../utils/errors.rkt"
          "../config.rkt"
-         "../core/rules.rkt"
          "matcher.rkt"
          "types.rkt"
          "syntax.rkt"
-         "../utils/float.rkt"
-         "generators.rkt")
+         "../syntax/float.rkt"
+         "generators.rkt"
+         "block.rkt")
 
 ;;; Platforms describe a set of representations, operator, and constants
 ;;; Herbie should use during its improvement loop. Platforms are just
@@ -29,16 +29,16 @@
      (fprintf port "#<platform>"))])
 
 (provide *active-platform*
-         platform-lifting-rules
-         platform-lowering-rules
          platform-copy
-         validate-platform!
          repr-exists?
          get-representation
          impl-exists?
          impl-info
          prog->spec
+         block-to-spec!
          get-fpcore-impl
+         impl->fpcore
+         reset-fpcore-op-cache!
          (struct-out $platform)
          ;; Platform API
          ;; Operator sets
@@ -68,32 +68,28 @@
   (define impls (make-hash))
   (create-platform reprs impls repr-costs))
 
-(define (validate-platform! platform)
-  (when (empty? (platform-implementations platform))
-    (raise-herbie-error "Platform contains no operations"))
-  (for ([(name impl) (in-hash (platform-implementations platform))])
-    (define ctx (operator-impl-ctx impl))
-    (for ([repr (in-list (cons (context-repr ctx) (context-var-reprs ctx)))])
-      (unless (equal? (hash-ref (platform-representations platform) (representation-name repr) #f)
-                      repr)
-        (raise-herbie-error "Representation ~a not defined" (representation-name repr))))))
-
 ;; Returns the representation associated with `name`
 ;; attempts to generate the repr if not initially found
 (define (get-representation name)
   (define platform (*active-platform*))
   (define reprs (platform-representations platform))
-  (or (hash-ref reprs name #f)
-      (raise-herbie-error "Could not find support for ~a representation: ~a in a platform ~a"
-                          name
-                          (string-join (map ~s (hash-keys reprs)) ", ")
-                          (*platform-name*))))
+  (match name
+    [(? representation?) name]
+    [`(array ,elem ,len) (make-array-representation #:elem (get-representation elem) #:len len)]
+    [_
+     (or (hash-ref reprs name #f)
+         (raise-herbie-error "Could not find support for ~a representation: ~a in a platform ~a"
+                             name
+                             (string-join (map ~s (hash-keys reprs)) ", ")
+                             (*platform-name*)))]))
 
 (define (repr-exists? name)
   (define platform (*active-platform*))
   (define reprs (platform-representations platform))
-  (hash-has-key? reprs name))
-
+  (match name
+    [(? representation?) #t]
+    [`(array ,elem ,len) (and (exact-positive-integer? len) (repr-exists? elem))]
+    [_ (hash-has-key? reprs name)]))
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; LImpl -> LSpec
 
@@ -113,6 +109,62 @@
      (define env (map cons vars (map prog->spec args)))
      (pattern-substitute spec env)]))
 
+(define (block-to-spec! in-block out-block vs)
+  (define lower
+    (block-recurse
+     in-block
+     (lambda (v recurse)
+       (define node (val-def v))
+       (match node
+         [(? literal?) (block-add! out-block (literal-value node))]
+         [(? number?) (error 'block-to-spec! "unexpected spec node in input block: ~a" node)]
+         [(? symbol?) (block-add! out-block node)]
+         [(approx spec _) spec]
+         [(list (? impl-exists? impl) args ...)
+          (define vars (impl-info impl 'vars))
+          (define spec (impl-info impl 'spec))
+          (define env (map cons vars (map recurse args)))
+          (block-add! out-block (pattern-substitute spec env))]
+         [(list op args ...)
+          (error 'block-to-spec! "unexpected spec node in input block: ~a" node)]))))
+  (map lower vs))
+
+(module+ test
+  (require rackunit)
+
+  (define test-empty-ctx (context '() #f '()))
+
+  (let* ([in-block (block-empty test-empty-ctx)]
+         [out-block (block-empty test-empty-ctx)]
+         [x (block-add! in-block 'x)]
+         [x* (first (block-to-spec! in-block out-block (list x)))])
+    (check-equal? (val-block x*) out-block)
+    (check-equal? (val-def x*) 'x))
+
+  (let* ([block (block-empty test-empty-ctx)]
+         [spec-block (block-empty test-empty-ctx)]
+         [spec (block-add! spec-block 'x)]
+         [impl (block-add! block (literal 1 'binary64))]
+         [approx-v (block-add! block (approx spec impl))])
+    (check-equal? (block-to-spec! block spec-block (list approx-v)) (list spec)))
+
+  (let* ([in-block (block-empty test-empty-ctx)]
+         [out-block (block-empty test-empty-ctx)]
+         [spec (block-add! out-block 'x)]
+         [impl (block-add! in-block (literal 1 'binary64))]
+         [approx-v (block-add! in-block (approx spec impl))]
+         [spec* (first (block-to-spec! in-block out-block (list approx-v)))])
+    (check-equal? (val-block spec*) out-block)
+    (check-equal? (val-def spec*) 'x))
+
+  (let* ([in-block (block-empty test-empty-ctx)]
+         [out-block (block-empty test-empty-ctx)]
+         [num (block-add! in-block 1)]
+         [expr (block-add! in-block `(+ ,num ,num))])
+    (parameterize ([*active-platform* (make-empty-platform)])
+      (check-exn #rx"unexpected spec node" (λ () (block-to-spec! in-block out-block (list num))))
+      (check-exn #rx"unexpected spec node" (λ () (block-to-spec! in-block out-block (list expr)))))))
+
 ;; Expression predicates ;;
 
 (define (impl-exists? op)
@@ -123,7 +175,7 @@
 ;; Looks up a property `field` of an real operator `op`.
 ;; Panics if the operator is not found.
 (define/contract (impl-info impl-name field)
-  (-> symbol? (or/c 'name 'vars 'itype 'otype 'spec 'fpcore 'fl 'cost 'aggregate) any/c)
+  (-> symbol? (or/c 'vars 'itype 'otype 'spec 'fpcore 'fl 'cost 'aggregate) any/c)
   (define impls (platform-implementations (*active-platform*)))
   (define impl
     (hash-ref impls
@@ -131,7 +183,6 @@
               (lambda ()
                 (error 'impl-info "unknown impl '~a in platform ~a" impl-name (*platform-name*)))))
   (case field
-    [(name) (operator-impl-name impl)]
     [(vars) (context-vars (operator-impl-ctx impl))]
     [(itype) (context-var-reprs (operator-impl-ctx impl))]
     [(otype) (context-repr (operator-impl-ctx impl))]
@@ -154,10 +205,10 @@
 
 ; Cost model of a single node by a platform.
 ; Returns a procedure that must be called with the costs of the children.
-(define ((platform-node-cost-proc platform) expr repr)
+(define ((platform-node-cost-proc platform) expr)
   (match expr
-    [(? literal?) (lambda () (platform-repr-cost platform repr))]
-    [(? symbol?) (lambda () (platform-repr-cost platform repr))]
+    [(literal _ precision) (lambda () (platform-repr-cost platform (get-representation precision)))]
+    [(? symbol?) (lambda () 0)]
     [(list impl args ...)
      (define impl-cost (impl-info impl 'cost))
      (define impl-agg (impl-info impl 'aggregate))
@@ -169,64 +220,32 @@
 ; Cost model parameterized by a platform.
 (define (platform-cost-proc platform)
   (define node-cost-proc (platform-node-cost-proc platform))
-  (λ (expr repr)
-    (let loop ([expr expr]
-               [repr repr])
+  (λ (expr)
+    (let loop ([expr expr])
       (match expr
-        [(? literal?) ((node-cost-proc expr repr))]
-        [(? symbol?) ((node-cost-proc expr repr))]
-        [(approx _ impl) (loop impl repr)]
+        [(? literal?) ((node-cost-proc expr))]
+        [(? symbol?) ((node-cost-proc expr))]
+        [(approx _ impl) (loop impl)]
         [(list impl args ...)
-         (define cost-proc (node-cost-proc expr repr))
-         (define itypes (impl-info impl 'itype))
-         (apply cost-proc (map loop args itypes))]))))
-
-;; Rules from impl to spec (fixed for a particular platform)
-(define/reset *lifting-rules* (make-hash))
-
-;; Rules from spec to impl (fixed for a particular platform)
-(define/reset *lowering-rules* (make-hash))
-
-;; Synthesizes the LHS and RHS of lifting/lowering rules.
-(define (impl->rule-parts impl)
-  (define vars (impl-info impl 'vars))
-  (define spec (impl-info impl 'spec))
-  (values vars spec (cons impl vars)))
-
-;; Synthesizes lifting rules for a platform platform.
-(define (platform-lifting-rules [pform (*active-platform*)])
-  (define impls (platform-impls pform))
-  (for/list ([impl (in-list impls)])
-    (hash-ref! (*lifting-rules*)
-               (cons impl pform)
-               (lambda ()
-                 (define name (sym-append 'lift- impl))
-                 (define-values (vars spec-expr impl-expr) (impl->rule-parts impl))
-                 (rule name impl-expr spec-expr '(lifting))))))
-
-;; Synthesizes lowering rules for a given platform.
-(define (platform-lowering-rules [pform (*active-platform*)])
-  (define impls (platform-impls pform))
-  (append* (for/list ([impl (in-list impls)])
-             (hash-ref! (*lowering-rules*)
-                        (cons impl pform)
-                        (lambda ()
-                          (define name (sym-append 'lower- impl))
-                          (define-values (vars spec-expr impl-expr) (impl->rule-parts impl))
-                          (list (rule name spec-expr impl-expr '(lowering))
-                                (rule (sym-append 'lower-unsound- impl)
-                                      (add-unsound spec-expr)
-                                      impl-expr
-                                      '(lowering))))))))
+         (define cost-proc (node-cost-proc expr))
+         (apply cost-proc (map loop args))]))))
 
 ;; Extracts the `fpcore` field of an operator implementation
-;; as a property dictionary and expression.
+;; as a property dictionary and operation.
 (define (impl->fpcore impl)
-  (match (impl-info impl 'fpcore)
-    [(list '! props ... body) (values (props->dict props) body)]
-    [body (values '() body)]))
+  (define-values (props body)
+    (match (impl-info impl 'fpcore)
+      [(list '! props ... body) (values (props->dict props) body)]
+      [body (values '() body)]))
+  (values props
+          (if (symbol? body)
+              (list body)
+              body)))
 
 (define/reset op-hash #f)
+
+(define (reset-fpcore-op-cache!)
+  (op-hash #f))
 
 ;; For a given FPCore operator, rounding context, and input representations,
 ;; finds the best operator implementation. Panics if none can be found.
@@ -236,12 +255,8 @@
     (define h (make-hash))
     (for ([impl (in-list (platform-impls (*active-platform*)))])
       (define-values (_ expr) (impl->fpcore impl))
-      (define expr*
-        (if (symbol? expr)
-            (list expr)
-            expr))
-      (when (list? expr*)
-        (hash-update! h (car expr*) (curry cons impl) '())))
+      (when (list? expr)
+        (hash-update! h (car expr) (curry cons impl) '())))
     (op-hash h))
 
   ; gather all implementations that have the same spec, input representations,
@@ -251,12 +266,8 @@
           (for ([impl (in-list (hash-ref (op-hash) op '()))]
                 #:when (equal? ireprs (impl-info impl 'itype)))
             (define-values (prop-dict* expr) (impl->fpcore impl))
-            (define expr*
-              (if (symbol? expr)
-                  (list expr)
-                  expr)) ; Handle named constants
             (define pattern (cons op (map (lambda (_) (gensym)) ireprs)))
-            (when (and (subset? prop-dict* prop-dict) (pattern-match pattern expr*))
+            (when (and (subset? prop-dict* prop-dict) (pattern-match pattern expr))
               (sow impl)))))
   ; check that we have any matching impls
   (cond
@@ -286,18 +297,18 @@
   (define reprs (platform-representations platform))
   (define repr-costs (platform-representation-costs platform))
 
-  (printf "Representations:\n")
+  (displayln "Representations:")
   (define reprs-data
-    (for/list ([(_ repr) (in-hash reprs)]
+    (for/list ([repr (in-hash-values reprs)]
                [n (in-naturals)])
       (match-define (representation name type _ _ _ _ total-bits _) repr)
       (define cost (hash-ref repr-costs name))
       (list n name type total-bits cost)))
   (write-table reprs-data (list "idx" "name" "type" "#bits" "cost"))
 
-  (printf "\nImplementations\n")
+  (displayln "\nImplementations")
   (define impls-data
-    (for/list ([(_ impl) (in-hash impls)]
+    (for/list ([impl (in-hash-values impls)]
                [n (in-naturals)])
       (define name (operator-impl-name impl))
       (define itype (map representation-name (context-var-reprs (operator-impl-ctx impl))))
@@ -328,15 +339,15 @@
   (printf "~a" (~a (list-ref headers 0) #:width (vector-ref cell-widths 0)))
   (for ([i (in-range 1 row-length)])
     (printf "|~a" (~a (list-ref headers i) #:width (vector-ref cell-widths i))))
-  (printf "\n")
+  (newline)
   (printf "~a" (~a "" #:width (vector-ref cell-widths 0) #:right-pad-string "-"))
   (for ([i (in-range 1 row-length)])
     (printf "+~a" (~a "" #:width (vector-ref cell-widths i) #:right-pad-string "-")))
-  (printf "\n")
+  (newline)
 
   ; Content
   (for ([row data])
     (printf "~a" (~a (list-ref row 0) #:width (vector-ref cell-widths 0)))
     (for ([i (in-range 1 row-length)])
       (printf "|~a" (~a (list-ref row i) #:width (vector-ref cell-widths i))))
-    (printf "\n")))
+    (newline)))
